@@ -819,11 +819,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if diff := pnSpace.history.Difference(pnSpace.largestAcked, pn); diff >= packetThreshold {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {
-					h.logger.Debugf("\tlost packet %d (reordering threshold)", pn)
+					h.logger.Debugf("\tlost packet %d (reordering threshold, %d packets acknowledged before)", pn, diff)
 				}
 				if h.qlogger != nil {
 					h.qlogger.RecordEvent(qlog.PacketLost{
