@@ -20,8 +20,9 @@ import (
 const (
 	cubeScale                 = 40
 	cubeCongestionWindowScale = 410
-	cubeFactor                = 1 << cubeScale / cubeCongestionWindowScale / maxDatagramSize
-	// TODO: when re-enabling cubic, make sure to use the actual packet size here
+	// maxDatagramSize is the default initial datagram size. Cubic uses the
+	// actual current datagram size (c.maxDatagramSize) in all calculations;
+	// this constant is kept only for package-level test helpers in cubic_test.go.
 	maxDatagramSize = protocol.ByteCount(protocol.InitialPacketSize)
 )
 
@@ -41,6 +42,11 @@ type Cubic struct {
 
 	// Number of connections to simulate.
 	numConnections int
+
+	// Current maximum datagram size. Updated via SetMaxDatagramSize when MTU
+	// discovery increases the path MTU. All window calculations use this value
+	// so that CUBIC remains correct after MTU probing.
+	maxDatagramSize protocol.ByteCount
 
 	// Time when this cycle started, after last loss event.
 	epoch monotime.Time
@@ -67,13 +73,21 @@ type Cubic struct {
 }
 
 // NewCubic returns a new Cubic instance
-func NewCubic(clock Clock) *Cubic {
+func NewCubic(clock Clock, initialMaxDatagramSize protocol.ByteCount) *Cubic {
 	c := &Cubic{
-		clock:          clock,
-		numConnections: defaultNumConnections,
+		clock:           clock,
+		numConnections:  defaultNumConnections,
+		maxDatagramSize: initialMaxDatagramSize,
 	}
 	c.Reset()
 	return c
+}
+
+// SetMaxDatagramSize updates the datagram size used in all CUBIC window
+// calculations. Called by cubicSender.SetMaxDatagramSize when MTU discovery
+// increases the path MTU mid-connection.
+func (c *Cubic) SetMaxDatagramSize(s protocol.ByteCount) {
+	c.maxDatagramSize = s
 }
 
 // Reset is called after a timeout to reset the cubic state
@@ -162,6 +176,9 @@ func (c *Cubic) CongestionWindowAfterAck(
 			c.timeToOriginPoint = 0
 			c.originPointCongestionWindow = currentCongestionWindow
 		} else {
+			// cubeFactor depends on the current datagram size; compute it here so
+			// that MTU changes after construction are reflected in K calculations.
+			cubeFactor := protocol.ByteCount(1<<cubeScale) / cubeCongestionWindowScale / c.maxDatagramSize
 			c.timeToOriginPoint = uint32(math.Cbrt(float64(cubeFactor * (c.lastMaxCongestionWindow - currentCongestionWindow))))
 			c.originPointCongestionWindow = c.lastMaxCongestionWindow
 		}
@@ -179,7 +196,7 @@ func (c *Cubic) CongestionWindowAfterAck(
 		offset = -offset
 	}
 
-	deltaCongestionWindow := protocol.ByteCount(cubeCongestionWindowScale*offset*offset*offset) * maxDatagramSize >> cubeScale
+	deltaCongestionWindow := protocol.ByteCount(cubeCongestionWindowScale*offset*offset*offset) * c.maxDatagramSize >> cubeScale
 	var targetCongestionWindow protocol.ByteCount
 	if elapsedTime > int64(c.timeToOriginPoint) {
 		targetCongestionWindow = c.originPointCongestionWindow + deltaCongestionWindow
@@ -194,7 +211,7 @@ func (c *Cubic) CongestionWindowAfterAck(
 	// congestion windows (less than 25), the formula below will
 	// increase slightly slower than linearly per estimated tcp window
 	// of bytes.
-	c.estimatedTCPcongestionWindow += protocol.ByteCount(float32(c.ackedBytesCount) * c.alpha() * float32(maxDatagramSize) / float32(c.estimatedTCPcongestionWindow))
+	c.estimatedTCPcongestionWindow += protocol.ByteCount(float32(c.ackedBytesCount) * c.alpha() * float32(c.maxDatagramSize) / float32(c.estimatedTCPcongestionWindow))
 	c.ackedBytesCount = 0
 
 	// We have a new cubic congestion window.

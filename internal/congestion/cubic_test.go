@@ -29,7 +29,7 @@ func cubicConvexCwnd(initialCwnd protocol.ByteCount, rtt, elapsedTime time.Durat
 
 func TestCubicAboveOriginWithTighterBounds(t *testing.T) {
 	var clock mockClock
-	cubic := NewCubic(&clock)
+	cubic := NewCubic(&clock, maxDatagramSize)
 	cubic.SetNumConnections(int(numConnections))
 
 	// Convex growth.
@@ -80,7 +80,7 @@ func TestCubicAboveOriginWithTighterBounds(t *testing.T) {
 
 func TestCubicAboveOriginWithFineGrainedCubing(t *testing.T) {
 	var clock mockClock
-	cubic := NewCubic(&clock)
+	cubic := NewCubic(&clock, maxDatagramSize)
 	cubic.SetNumConnections(int(numConnections))
 
 	currentCwnd := 1000 * maxDatagramSize
@@ -107,7 +107,7 @@ func TestCubicAboveOriginWithFineGrainedCubing(t *testing.T) {
 
 func TestCubicHandlesPerAckUpdates(t *testing.T) {
 	var clock mockClock
-	cubic := NewCubic(&clock)
+	cubic := NewCubic(&clock, maxDatagramSize)
 	cubic.SetNumConnections(int(numConnections))
 
 	initialCwndPackets := 150
@@ -141,7 +141,7 @@ func TestCubicHandlesPerAckUpdates(t *testing.T) {
 
 func TestCubicHandlesLossEvents(t *testing.T) {
 	var clock mockClock
-	cubic := NewCubic(&clock)
+	cubic := NewCubic(&clock, maxDatagramSize)
 	cubic.SetNumConnections(int(numConnections))
 
 	rttMin := 100 * time.Millisecond
@@ -180,7 +180,7 @@ func TestCubicHandlesLossEvents(t *testing.T) {
 
 func TestCubicBelowOrigin(t *testing.T) {
 	var clock mockClock
-	cubic := NewCubic(&clock)
+	cubic := NewCubic(&clock, maxDatagramSize)
 	cubic.SetNumConnections(int(numConnections))
 
 	rttMin := 100 * time.Millisecond

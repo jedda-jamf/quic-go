@@ -107,7 +107,7 @@ func newCubicSender(
 		initialMaxCongestionWindow: initialMaxCongestionWindow,
 		congestionWindow:           initialCongestionWindow,
 		slowStartThreshold:         protocol.MaxByteCount,
-		cubic:                      NewCubic(clock),
+		cubic:                      NewCubic(clock, initialMaxDatagramSize),
 		clock:                      clock,
 		reno:                       reno,
 		qlogger:                    qlogger,
@@ -323,6 +323,7 @@ func (c *cubicSender) SetMaxDatagramSize(s protocol.ByteCount) {
 	}
 	cwndIsMinCwnd := c.congestionWindow == c.minCongestionWindow()
 	c.maxDatagramSize = s
+	c.cubic.SetMaxDatagramSize(s)
 	if cwndIsMinCwnd {
 		c.congestionWindow = c.minCongestionWindow()
 	}
