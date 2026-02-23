@@ -8,10 +8,19 @@ import (
 	"slices"
 	"time"
 
+	"github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/qlogwriter"
 )
+
+// CongestionController is the interface that congestion control algorithms must implement
+// to be used with Config.Congestion. Supply a factory function returning this type to
+// replace the default NewReno algorithm on a per-connection basis.
+//
+// All method signatures reference internal types; implementations must live within the
+// quic-go module (i.e. in internal/congestion) until those types are re-exported.
+type CongestionController = congestion.SendAlgorithmWithDebugInfos
 
 // The StreamID is the ID of a QUIC stream.
 type StreamID = protocol.StreamID
@@ -175,6 +184,15 @@ type Config struct {
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool
+
+	// Congestion optionally provides a factory function that returns a custom congestion
+	// controller. The factory is called once per connection, immediately before the
+	// handshake begins. If nil, the default NewReno implementation is used.
+	//
+	// The returned controller must implement CongestionController (an alias for
+	// internal/congestion.SendAlgorithmWithDebugInfos). See the algo/* branches for
+	// reference implementations.
+	Congestion func() CongestionController
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
 }

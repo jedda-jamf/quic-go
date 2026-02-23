@@ -118,6 +118,7 @@ func testSentPacketHandlerSendAndAcknowledge(t *testing.T, encLevel protocol.Enc
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -173,6 +174,7 @@ func TestSentPacketHandlerAcknowledgeSkippedPacket(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -216,6 +218,7 @@ func TestSentPacketHandlerRTTAckEliciting(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		&eventRecorder,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -304,6 +307,7 @@ func TestSentPacketHandlerRTTAcrossPacketNumberSpaces(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -365,6 +369,7 @@ func testSentPacketHandlerRTTAckDelays(t *testing.T, encLevel protocol.Encryptio
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -456,6 +461,7 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 		nil,
 		protocol.PerspectiveServer,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -527,6 +533,7 @@ func testSentPacketHandlerAmplificationLimitClient(t *testing.T, dropHandshake b
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -583,6 +590,7 @@ func TestSentPacketHandlerDelayBasedLossDetection(t *testing.T) {
 		nil,
 		protocol.PerspectiveServer,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -638,6 +646,7 @@ func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
 		nil,
 		protocol.PerspectiveServer,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -700,6 +709,7 @@ func testSentPacketHandlerPTO(t *testing.T, encLevel protocol.EncryptionLevel, p
 		nil,
 		protocol.PerspectiveServer,
 		&eventRecorder,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -918,6 +928,7 @@ func TestSentPacketHandlerPacketNumberSpacesPTO(t *testing.T) {
 		nil,
 		protocol.PerspectiveServer,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -1011,6 +1022,7 @@ func TestSentPacketHandler0RTT(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -1063,6 +1075,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 		nil,
 		protocol.PerspectiveServer,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	sph.(*sentPacketHandler).congestion = cong
@@ -1164,6 +1177,7 @@ func testSentPacketHandlerRetry(t *testing.T, rtt, expectedRTT time.Duration) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -1216,6 +1230,7 @@ func TestSentPacketHandlerRetryAfterPTO(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -1261,6 +1276,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	sph.(*sentPacketHandler).ecnTracker = ecnHandler
@@ -1366,6 +1382,7 @@ func TestSentPacketHandlerPathProbe(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
@@ -1447,6 +1464,7 @@ func TestSentPacketHandlerPathProbeAckAndLoss(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
@@ -1524,6 +1542,7 @@ func testSentPacketHandlerRandomized(t *testing.T, seed uint64) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	sph.DropPackets(protocol.EncryptionInitial, monotime.Now())
@@ -1594,6 +1613,7 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 		nil,
 		protocol.PerspectiveClient,
 		&eventRecorder,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 
@@ -1730,6 +1750,7 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
 		nil,
 		protocol.PerspectiveClient,
 		nil,
+		nil, // customCC: use default NewReno
 		utils.DefaultLogger,
 	)
 	now := monotime.Now()
