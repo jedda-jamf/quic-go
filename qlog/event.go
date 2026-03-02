@@ -811,6 +811,29 @@ func (e ECNStateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	return h.err
 }
 
+// ECNCongestion is emitted when ECN-CE marks trigger a congestion response.
+// This happens when the path is ECN-capable and the receiver reports increased
+// CE counts in ACK frames, indicating that routers marked packets as congested.
+type ECNCongestion struct {
+	// NewCEMarks is the number of new CE marks detected in this ACK.
+	NewCEMarks int64
+	// TotalCEMarks is the cumulative CE count acknowledged so far.
+	TotalCEMarks int64
+}
+
+func (e ECNCongestion) Name() string { return "recovery:ecn_congestion" }
+
+func (e ECNCongestion) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("ce_marks"))
+	h.WriteToken(jsontext.Int(e.NewCEMarks))
+	h.WriteToken(jsontext.String("total_ce_marks"))
+	h.WriteToken(jsontext.Int(e.TotalCEMarks))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 type ALPNInformation struct {
 	ChosenALPN string
 }

@@ -299,7 +299,16 @@ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ec
 
 	// Don't trust CE marks before having confirmed ECN capability of the path.
 	// Otherwise, mangling would be misinterpreted as actual congestion.
-	return e.state == ecnStateCapable && newECNCE > 0
+	if e.state == ecnStateCapable && newECNCE > 0 {
+		if e.qlogger != nil {
+			e.qlogger.RecordEvent(qlog.ECNCongestion{
+				NewCEMarks:   newECNCE,
+				TotalCEMarks: e.numAckedECNCE,
+			})
+		}
+		return true
+	}
+	return false
 }
 
 // failIfMangled fails ECN validation if all testing packets are lost or CE-marked.

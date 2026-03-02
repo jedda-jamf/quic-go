@@ -188,7 +188,10 @@ func TestECNValidationNotEnoughECNCounts(t *testing.T) {
 	// First only acknowledge some packets sent with ECN marks.
 	require.True(t, ecnTracker.HandleNewlyAcked(getAckedPackets(1, 2, 3, 12), 2, 0, 1))
 	require.Equal(t,
-		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateCapable}},
+		[]qlogwriter.Event{
+			qlog.ECNStateUpdated{State: qlog.ECNStateCapable},
+			qlog.ECNCongestion{NewCEMarks: 1, TotalCEMarks: 1},
+		},
 		eventRecorder.Events(),
 	)
 	eventRecorder.Clear()
@@ -339,7 +342,10 @@ func TestECNCongestionDetection(t *testing.T) {
 	// Receive one CE count.
 	require.True(t, ecnTracker.HandleNewlyAcked(getAckedPackets(1, 2, 3, 12), 2, 0, 1))
 	require.Equal(t,
-		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateCapable}},
+		[]qlogwriter.Event{
+			qlog.ECNStateUpdated{State: qlog.ECNStateCapable},
+			qlog.ECNCongestion{NewCEMarks: 1, TotalCEMarks: 1},
+		},
 		eventRecorder.Events(),
 	)
 
@@ -349,5 +355,8 @@ func TestECNCongestionDetection(t *testing.T) {
 
 	// Increase in CE. More congestion.
 	require.True(t, ecnTracker.HandleNewlyAcked(getAckedPackets(7, 8, 9, 14), 7, 0, 2))
-	require.Empty(t, eventRecorder.Events())
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNCongestion{NewCEMarks: 1, TotalCEMarks: 2}},
+		eventRecorder.Events(),
+	)
 }
