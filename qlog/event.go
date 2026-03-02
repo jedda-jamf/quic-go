@@ -834,6 +834,33 @@ func (e ECNCongestion) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	return h.err
 }
 
+// RACKThresholdUpdated is emitted when the RACK-style dynamic reordering
+// threshold changes. This occurs when spurious losses are detected, indicating
+// that the network has more reordering than the current threshold allows.
+type RACKThresholdUpdated struct {
+	// Threshold is the new packet reordering threshold (RFC 9002 default is 3).
+	Threshold uint64
+	// SpuriousLossCount is the cumulative number of spurious losses detected.
+	SpuriousLossCount uint64
+	// MaxObservedReorder is the maximum packet reordering distance observed.
+	MaxObservedReorder uint64
+}
+
+func (e RACKThresholdUpdated) Name() string { return "recovery:rack_threshold_updated" }
+
+func (e RACKThresholdUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("threshold"))
+	h.WriteToken(jsontext.Uint(e.Threshold))
+	h.WriteToken(jsontext.String("spurious_loss_count"))
+	h.WriteToken(jsontext.Uint(e.SpuriousLossCount))
+	h.WriteToken(jsontext.String("max_observed_reorder"))
+	h.WriteToken(jsontext.Uint(e.MaxObservedReorder))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 type ALPNInformation struct {
 	ChosenALPN string
 }

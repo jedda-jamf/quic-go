@@ -136,12 +136,11 @@ func NewSentPacketHandler(
 	cc := customCC
 	usesDefault := false
 	if cc == nil {
-		cc = congestion.NewCubicSender(
+		cc = congestion.NewNewRenoRackSender(
 			congestion.DefaultClock{},
 			rttStats,
 			connStats,
 			initialMaxDatagramSize,
-			true, // use Reno
 			qlogger,
 		)
 		usesDefault = true
@@ -561,6 +560,8 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 					TimeReordering:   timeReordering,
 				})
 			}
+			// Notify CC so RACK-style implementations can adapt threshold
+			h.congestion.OnSpuriousLossDetected(pn, packetReordering)
 			spuriousLosses = append(spuriousLosses, pn)
 		}
 	}
@@ -879,6 +880,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
+<<<<<<< HEAD
 		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetReorderThreshold {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
