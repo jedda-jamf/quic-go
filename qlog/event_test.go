@@ -868,6 +868,18 @@ func TestECNStateUpdatedWithTrigger(t *testing.T) {
 	require.Equal(t, "ACK doesn't contain ECN marks", ev["trigger"])
 }
 
+func TestECNCongestion(t *testing.T) {
+	name, ev := testEventEncoding(t, &ECNCongestion{
+		NewCEMarks:   5,
+		TotalCEMarks: 42,
+	})
+
+	require.Equal(t, "recovery:ecn_congestion", name)
+	require.Len(t, ev, 2)
+	require.EqualValues(t, 5, ev["ce_marks"])
+	require.EqualValues(t, 42, ev["total_ce_marks"])
+}
+
 func TestALPNInformation(t *testing.T) {
 	name, ev := testEventEncoding(t, &ALPNInformation{
 		ChosenALPN: "h3",
