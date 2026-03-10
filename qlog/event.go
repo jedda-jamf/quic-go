@@ -982,6 +982,36 @@ func (e BBRv3ECNUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	return h.err
 }
 
+// BBRv3SpuriousLossRecovery is emitted when BBRv3 recovers from spurious loss.
+// Per RFC draft-ietf-ccwg-bbr-05 §5.5.11, BBRv3 restores model bounds when
+// the transport detects that a previous loss declaration was spurious.
+type BBRv3SpuriousLossRecovery struct {
+	SpuriousCount int    // Number of packets determined to be spuriously lost
+	RestoredBwLo  uint64 // Restored bandwidth lower bound (bytes/s)
+	RestoredInflightLo uint64 // Restored inflight lower bound (bytes)
+	RestoredInflightHi uint64 // Restored inflight upper bound (bytes)
+	RestoredCwnd  uint64 // Congestion window after restoration (bytes)
+}
+
+func (e BBRv3SpuriousLossRecovery) Name() string { return "recovery:bbr_spurious_loss_recovery" }
+
+func (e BBRv3SpuriousLossRecovery) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("spurious_count"))
+	h.WriteToken(jsontext.Int(int64(e.SpuriousCount)))
+	h.WriteToken(jsontext.String("restored_bw_lo"))
+	h.WriteToken(jsontext.Uint(e.RestoredBwLo))
+	h.WriteToken(jsontext.String("restored_inflight_lo"))
+	h.WriteToken(jsontext.Uint(e.RestoredInflightLo))
+	h.WriteToken(jsontext.String("restored_inflight_hi"))
+	h.WriteToken(jsontext.Uint(e.RestoredInflightHi))
+	h.WriteToken(jsontext.String("restored_cwnd"))
+	h.WriteToken(jsontext.Uint(e.RestoredCwnd))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 func (e ALPNInformation) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)

@@ -192,6 +192,16 @@ const (
 
 	// maxBBRv3CongestionWindow is the maximum allowed cwnd.
 	maxBBRv3CongestionWindow = protocol.ByteCount(256 * 1024 * 1024)
+
+	// ==========================================================================
+	// SPURIOUS LOSS RECOVERY
+	// ==========================================================================
+
+	// spuriousLossRecoveryThreshold defines the minimum number of spurious losses
+	// required before restoring saved state per RFC §5.5.11. A value of 0 means
+	// recover on any spurious loss detection (spuriousCount >= 1). Higher values
+	// can prevent ping-ponging in scenarios with mixed reordering and real loss.
+	spuriousLossRecoveryThreshold = 0
 )
 
 // bbrProbeBWPhase represents the sub-phases within ProbeBW state.
@@ -417,12 +427,24 @@ type BBRv3 struct {
 	lastState      BBRState
 	lastPhase      bbrProbeBWPhase
 	lastRoundCount uint64
+
+	// Spurious loss recovery state per RFC §5.5.11.
+	// When loss is first detected in a round, we save state so it can be
+	// restored if the loss is later determined to be spurious.
+	// This prevents BBRv3 from permanently reducing its model bounds due to
+	// reordering that was misclassified as loss.
+	undoState      BBRState
+	undoProbeBWPhase bbrProbeBWPhase
+	undoBwLo       protocol.ByteCount
+	undoInflightLo protocol.ByteCount
+	undoInflightHi protocol.ByteCount
 }
 
 var (
 	_ SendAlgorithm               = &BBRv3{}
 	_ SendAlgorithmWithRTTStats   = &BBRv3{}
 	_ SendAlgorithmWithDebugInfos = &BBRv3{}
+	_ SpuriousLossHandler         = &BBRv3{}
 )
 
 // NewBBRV3 creates a new BBRv3 congestion controller.
@@ -462,6 +484,10 @@ func NewBBRV3(
 		lastState:        BBRStartup,
 		lastPhase:        probeBWDown,
 		ackEpochStart:    now,
+		// Initialize undo state to "no saved state"
+		undoBwLo:       protocol.MaxByteCount,
+		undoInflightLo: protocol.MaxByteCount,
+		undoInflightHi: protocol.MaxByteCount,
 	}
 	if bbr.congestionWindow < bbr.minPipeCwnd {
 		bbr.congestionWindow = bbr.minPipeCwnd
@@ -1356,9 +1382,93 @@ func (bbr *BBRv3) exitProbeRTT(now monotime.Time) {
 func (bbr *BBRv3) noteLoss() {
 	if !bbr.lossInRound {
 		bbr.lossRoundDelivered = bbr.totalBytesAcked
+		// First loss in this round - save state for potential spurious loss recovery.
+		// Per RFC §5.5.11.1, we save state when loss recovery starts so we can
+		// restore it if the loss is later determined to be spurious.
+		bbr.saveStateUponLoss()
 	}
 	bbr.lossInRound = true
 	bbr.lossInCycle = true
+}
+
+// saveStateUponLoss saves BBRv3 model state for potential spurious loss recovery.
+// Per RFC §5.5.11.1 (BBRSaveStateUponLoss), this is called on first loss in a round.
+func (bbr *BBRv3) saveStateUponLoss() {
+	bbr.undoState = bbr.state
+	bbr.undoProbeBWPhase = bbr.probeBWPhase
+	bbr.undoBwLo = bbr.bwLo
+	bbr.undoInflightLo = bbr.inflightLo
+	bbr.undoInflightHi = bbr.inflightHi
+}
+
+// OnSpuriousLossDetected implements SpuriousLossHandler.
+// Called when the transport detects that previously declared losses were spurious.
+// Per RFC §5.5.11.2 (BBRHandleSpuriousLossDetection), we restore model bounds
+// to their pre-loss values to undo loss-driven reductions that were triggered
+// by reordering rather than actual congestion.
+func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
+	// Threshold check: only recover if enough spurious losses detected.
+	// spuriousLossRecoveryThreshold=0 means recover on any spurious loss (count >= 1).
+	// Higher values require that many spurious losses before triggering recovery.
+	if spuriousCount < spuriousLossRecoveryThreshold {
+		return
+	}
+
+	// Clear loss-in-round flag since the loss was spurious
+	bbr.lossInRound = false
+
+	// Reset full bandwidth estimator to re-probe after spurious loss
+	bbr.resetFullBw()
+
+	// Restore bounds to max of current and saved values.
+	// Using max() ensures we only raise bounds, never lower them.
+	// This prevents ping-ponging if some losses were real and some spurious.
+	if bbr.undoBwLo != protocol.MaxByteCount && bbr.undoBwLo > bbr.bwLo {
+		bbr.bwLo = bbr.undoBwLo
+	}
+	if bbr.undoInflightLo != protocol.MaxByteCount && bbr.undoInflightLo > bbr.inflightLo {
+		bbr.inflightLo = bbr.undoInflightLo
+	}
+	if bbr.undoInflightHi != protocol.MaxByteCount && bbr.undoInflightHi > bbr.inflightHi {
+		bbr.inflightHi = bbr.undoInflightHi
+	}
+
+	// If we were probing bandwidth when loss occurred, return to that state.
+	// Per RFC §5.5.11.2, we restore probing state if not in ProbeRTT.
+	if bbr.state != BBRProbeRTT && bbr.state != bbr.undoState {
+		if bbr.undoState == BBRStartup {
+			bbr.state = BBRStartup
+			bbr.pacingGain = STARTUP_PACING_GAIN
+			bbr.cwndGain = STARTUP_CWND_GAIN
+			bbr.fullBandwidthReached = false
+		} else if bbr.undoState == BBRProbeBW && bbr.undoProbeBWPhase == probeBWUp {
+			bbr.startProbeBWUp(monotime.Now())
+		}
+	}
+
+	// Recalculate cwnd with restored bounds
+	bbr.setCwnd(bbrRateSample{})
+
+	// Emit qlog event for debugging/analysis
+	if bbr.qlogger != nil {
+		var bwLoVal, inflightLoVal, inflightHiVal uint64
+		if bbr.bwLo != protocol.MaxByteCount {
+			bwLoVal = uint64(bbr.bwLo)
+		}
+		if bbr.inflightLo != protocol.MaxByteCount {
+			inflightLoVal = uint64(bbr.inflightLo)
+		}
+		if bbr.inflightHi != protocol.MaxByteCount {
+			inflightHiVal = uint64(bbr.inflightHi)
+		}
+		bbr.qlogger.RecordEvent(qlog.BBRv3SpuriousLossRecovery{
+			SpuriousCount:      spuriousCount,
+			RestoredBwLo:       bwLoVal,
+			RestoredInflightLo: inflightLoVal,
+			RestoredInflightHi: inflightHiVal,
+			RestoredCwnd:       uint64(bbr.congestionWindow),
+		})
+	}
 }
 
 // isInflightTooHigh checks for loss/ECN threshold violations per RFC §2.7.

@@ -258,3 +258,130 @@ func TestBBRv3PhaseString(t *testing.T) {
 	require.Equal(t, "refill", probeBWRefill.String())
 	require.Equal(t, "unknown", bbrProbeBWPhase(99).String())
 }
+
+func TestBBRv3SpuriousLossRecovery(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up in ProbeBW CRUISE state (where loss responses apply)
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 1_000_000
+	bbr.minRTT = 20 * time.Millisecond
+	bbr.congestionWindow = 100_000
+
+	// Initialize bounds to non-MaxByteCount values
+	bbr.bwLo = 800_000
+	bbr.inflightLo = 80_000
+	bbr.inflightHi = 120_000
+
+	// Simulate loss detection - this saves state
+	bbr.OnPacketSent(now, 0, 1, 1200, true)
+	bbr.OnCongestionEvent(1, 1200, 0)
+
+	// Verify state was saved
+	require.Equal(t, BBRProbeBW, bbr.undoState)
+	require.Equal(t, protocol.ByteCount(800_000), bbr.undoBwLo)
+	require.Equal(t, protocol.ByteCount(80_000), bbr.undoInflightLo)
+	require.Equal(t, protocol.ByteCount(120_000), bbr.undoInflightHi)
+
+	// Now simulate the round ending with loss - this triggers bound adaptation
+	bbr.roundStart = true
+	bbr.lossRoundStart = true
+	bbr.bwLatest = 700_000
+	bbr.inflightLatest = 70_000
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	// Verify bounds were reduced (by BETA_REDUCTION = 30%)
+	expectedBwLo := protocol.ByteCount(float64(800_000) * 0.70)       // 560_000
+	expectedInflightLo := protocol.ByteCount(float64(80_000) * 0.70) // 56_000
+	require.Equal(t, max(bbr.bwLatest, expectedBwLo), bbr.bwLo)
+	require.Equal(t, max(bbr.inflightLatest, expectedInflightLo), bbr.inflightLo)
+
+	// Now call OnSpuriousLossDetected - this should restore bounds
+	bbr.OnSpuriousLossDetected(1)
+
+	// Verify bounds were restored to saved values (using max)
+	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo)
+	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
+	require.Equal(t, protocol.ByteCount(120_000), bbr.inflightHi)
+	require.False(t, bbr.lossInRound)
+}
+
+func TestBBRv3SpuriousLossRecoveryRestoresStartupState(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Start in Startup
+	bbr.state = BBRStartup
+	bbr.fullBandwidthReached = false
+	bbr.pacingGain = STARTUP_PACING_GAIN
+	bbr.cwndGain = STARTUP_CWND_GAIN
+
+	// Simulate loss causing exit to Drain (save state first)
+	bbr.saveStateUponLoss()
+	bbr.state = BBRDrain
+	bbr.fullBandwidthReached = true
+
+	// Spurious loss detected - should restore Startup state
+	bbr.OnSpuriousLossDetected(1)
+
+	require.Equal(t, BBRStartup, bbr.state)
+	require.Equal(t, STARTUP_PACING_GAIN, bbr.pacingGain)
+	require.Equal(t, STARTUP_CWND_GAIN, bbr.cwndGain)
+	require.False(t, bbr.fullBandwidthReached)
+}
+
+func TestBBRv3SpuriousLossRecoveryNoOpWhenNoSavedState(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Fresh BBRv3 with undo values at MaxByteCount (no saved state)
+	require.Equal(t, protocol.MaxByteCount, bbr.undoBwLo)
+	require.Equal(t, protocol.MaxByteCount, bbr.undoInflightLo)
+	require.Equal(t, protocol.MaxByteCount, bbr.undoInflightHi)
+
+	// Set some bounds
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+	bbr.inflightHi = 100_000
+	originalBwLo := bbr.bwLo
+	originalInflightLo := bbr.inflightLo
+	originalInflightHi := bbr.inflightHi
+
+	// Calling OnSpuriousLossDetected without prior loss should be safe
+	// and should not change bounds (MaxByteCount is not > current values)
+	bbr.OnSpuriousLossDetected(1)
+
+	require.Equal(t, originalBwLo, bbr.bwLo)
+	require.Equal(t, originalInflightLo, bbr.inflightLo)
+	require.Equal(t, originalInflightHi, bbr.inflightHi)
+}
+
+func TestBBRv3SpuriousLossRecoveryIdempotent(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up state and save it
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.bwLo = 800_000
+	bbr.inflightLo = 80_000
+	bbr.inflightHi = 120_000
+	bbr.saveStateUponLoss()
+
+	// Reduce bounds (simulating loss response)
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+	bbr.inflightHi = 90_000
+
+	// First call restores
+	bbr.OnSpuriousLossDetected(1)
+	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo)
+	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
+	require.Equal(t, protocol.ByteCount(120_000), bbr.inflightHi)
+
+	// Second call should be idempotent (no further changes)
+	bbr.OnSpuriousLossDetected(1)
+	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo)
+	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
+	require.Equal(t, protocol.ByteCount(120_000), bbr.inflightHi)
+}

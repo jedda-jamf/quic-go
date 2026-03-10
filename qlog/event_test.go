@@ -905,3 +905,21 @@ func TestDebugEvent(t *testing.T) {
 		require.Equal(t, "bar", ev["message"])
 	})
 }
+
+func TestBBRv3SpuriousLossRecovery(t *testing.T) {
+	name, ev := testEventEncoding(t, &BBRv3SpuriousLossRecovery{
+		SpuriousCount:      3,
+		RestoredBwLo:       800000,
+		RestoredInflightLo: 80000,
+		RestoredInflightHi: 120000,
+		RestoredCwnd:       100000,
+	})
+
+	require.Equal(t, "recovery:bbr_spurious_loss_recovery", name)
+	require.Len(t, ev, 5)
+	require.EqualValues(t, 3, ev["spurious_count"])
+	require.EqualValues(t, 800000, ev["restored_bw_lo"])
+	require.EqualValues(t, 80000, ev["restored_inflight_lo"])
+	require.EqualValues(t, 120000, ev["restored_inflight_hi"])
+	require.EqualValues(t, 100000, ev["restored_cwnd"])
+}
