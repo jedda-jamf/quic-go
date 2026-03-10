@@ -1541,7 +1541,15 @@ func (bbr *BBRv3) updateGains() {
 }
 
 func (bbr *BBRv3) setPacingRateWithGain(gain float64) {
-	bw := bbr.boundedBandwidth()
+	// Per RFC §5.6.1 table: during accelerating phases (Startup, REFILL, UP),
+	// pacing uses unbounded max_bw. During decelerating/cruising phases
+	// (DOWN, CRUISE, DRAIN, ProbeRTT), pacing is bounded by bw_shortterm.
+	var bw protocol.ByteCount
+	if bbr.isProbingBandwidth() {
+		bw = bbr.maxBandwidth()
+	} else {
+		bw = bbr.boundedBandwidth()
+	}
 	if bw <= 0 {
 		return
 	}
