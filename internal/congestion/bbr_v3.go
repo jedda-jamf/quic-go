@@ -1422,16 +1422,19 @@ func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
 	// Reset full bandwidth estimator to re-probe after spurious loss
 	bbr.resetFullBw()
 
-	// Restore bounds to max of current and saved values.
-	// Using max() ensures we only raise bounds, never lower them.
-	// This prevents ping-ponging if some losses were real and some spurious.
-	if bbr.undoBwLo != protocol.MaxByteCount && bbr.undoBwLo > bbr.bwLo {
+	// Restore bounds to max of current and saved values per RFC §5.5.11.2:
+	//   BBR.bw_shortterm = max(BBR.bw_shortterm, BBR.undo_bw_shortterm)
+	// Using simple > comparison implements max() correctly. Critically, if the
+	// saved value is MaxByteCount (meaning bounds were unconstrained before loss),
+	// we restore to MaxByteCount to remove the constraint. The previous check
+	// `!= MaxByteCount` incorrectly prevented restoring unconstrained state.
+	if bbr.undoBwLo > bbr.bwLo {
 		bbr.bwLo = bbr.undoBwLo
 	}
-	if bbr.undoInflightLo != protocol.MaxByteCount && bbr.undoInflightLo > bbr.inflightLo {
+	if bbr.undoInflightLo > bbr.inflightLo {
 		bbr.inflightLo = bbr.undoInflightLo
 	}
-	if bbr.undoInflightHi != protocol.MaxByteCount && bbr.undoInflightHi > bbr.inflightHi {
+	if bbr.undoInflightHi > bbr.inflightHi {
 		bbr.inflightHi = bbr.undoInflightHi
 	}
 

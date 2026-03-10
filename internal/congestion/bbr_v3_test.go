@@ -332,29 +332,29 @@ func TestBBRv3SpuriousLossRecoveryRestoresStartupState(t *testing.T) {
 	require.False(t, bbr.fullBandwidthReached)
 }
 
-func TestBBRv3SpuriousLossRecoveryNoOpWhenNoSavedState(t *testing.T) {
+func TestBBRv3SpuriousLossRecoveryRestoresUnconstrainedState(t *testing.T) {
 	bbr := newTestBBRv3()
 
-	// Fresh BBRv3 with undo values at MaxByteCount (no saved state)
+	// Fresh BBRv3 with undo values at MaxByteCount (unconstrained state saved)
 	require.Equal(t, protocol.MaxByteCount, bbr.undoBwLo)
 	require.Equal(t, protocol.MaxByteCount, bbr.undoInflightLo)
 	require.Equal(t, protocol.MaxByteCount, bbr.undoInflightHi)
 
-	// Set some bounds
+	// Simulate bounds being reduced after loss (as adaptLowerBounds would do)
 	bbr.bwLo = 500_000
 	bbr.inflightLo = 50_000
 	bbr.inflightHi = 100_000
-	originalBwLo := bbr.bwLo
-	originalInflightLo := bbr.inflightLo
-	originalInflightHi := bbr.inflightHi
 
-	// Calling OnSpuriousLossDetected without prior loss should be safe
-	// and should not change bounds (MaxByteCount is not > current values)
+	// Per RFC §5.5.11.2: bwLo = max(bwLo, undo_bwLo)
+	// If undo values are MaxByteCount (unconstrained), recovery should
+	// restore to MaxByteCount. This is critical for recovering from
+	// spurious loss that occurred when bounds were unconstrained.
 	bbr.OnSpuriousLossDetected(1)
 
-	require.Equal(t, originalBwLo, bbr.bwLo)
-	require.Equal(t, originalInflightLo, bbr.inflightLo)
-	require.Equal(t, originalInflightHi, bbr.inflightHi)
+	// Bounds should be restored to MaxByteCount (unconstrained)
+	require.Equal(t, protocol.MaxByteCount, bbr.bwLo)
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo)
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightHi)
 }
 
 func TestBBRv3SpuriousLossRecoveryIdempotent(t *testing.T) {
@@ -416,4 +416,45 @@ func TestBBRv3SpuriousLossRecoveryCwnd(t *testing.T) {
 	// Verify cwnd was restored
 	require.Equal(t, savedCwnd, bbr.congestionWindow)
 	require.Equal(t, protocol.ByteCount(100_000), bbr.congestionWindow)
+}
+
+func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
+	// This test simulates the real-world scenario causing performance issues:
+	// 1. After REFILL, bwLo/inflightLo are MaxByteCount (unconstrained)
+	// 2. Loss occurs and state is saved (undo values = MaxByteCount)
+	// 3. adaptLowerBounds reduces bwLo to a much lower value
+	// 4. Spurious loss detected - must restore to MaxByteCount
+	bbr := newTestBBRv3()
+
+	// Simulate state after REFILL phase (bounds are unconstrained)
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 20_000_000 // 20 MB/s = 160 Mbps
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.bwLo = protocol.MaxByteCount
+	bbr.inflightLo = protocol.MaxByteCount
+	bbr.inflightHi = 1_000_000 // 1 MB
+
+	// First loss in round - save state (captures MaxByteCount bounds)
+	bbr.saveStateUponLoss()
+	require.Equal(t, protocol.MaxByteCount, bbr.undoBwLo)
+	require.Equal(t, protocol.MaxByteCount, bbr.undoInflightLo)
+
+	// Simulate adaptLowerBounds reducing bounds (as happens in CRUISE after loss)
+	// This is what initLowerBounds + loss reduction does
+	bbr.bwLo = 12_000_000   // Reduced to 12 MB/s = 96 Mbps
+	bbr.inflightLo = 600_000 // Reduced inflight
+
+	// Verify bounds are now constrained
+	require.NotEqual(t, protocol.MaxByteCount, bbr.bwLo)
+	require.NotEqual(t, protocol.MaxByteCount, bbr.inflightLo)
+
+	// Spurious loss detected - should restore to MaxByteCount (unconstrained)
+	bbr.OnSpuriousLossDetected(1)
+
+	// Critical: bounds must be restored to MaxByteCount (unconstrained)
+	// This was broken before the fix - the != MaxByteCount check prevented restoration
+	require.Equal(t, protocol.MaxByteCount, bbr.bwLo, "bwLo should be restored to unconstrained")
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored to unconstrained")
 }
