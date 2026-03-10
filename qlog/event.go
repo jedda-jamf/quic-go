@@ -840,6 +840,148 @@ type ALPNInformation struct {
 
 func (e ALPNInformation) Name() string { return "transport:alpn_information" }
 
+// BBRv3StateUpdated logs state and phase transitions for BBRv3 congestion control.
+// This event enables time-series visualization of the BBRv3 state machine.
+type BBRv3StateUpdated struct {
+	State      string // Startup, Drain, ProbeBW, ProbeRTT
+	Phase      string // Up, Down, Cruise, Refill (for ProbeBW only)
+	RoundCount uint64
+}
+
+func (e BBRv3StateUpdated) Name() string { return "recovery:bbr_state_updated" }
+
+func (e BBRv3StateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("state"))
+	h.WriteToken(jsontext.String(e.State))
+	if e.Phase != "" {
+		h.WriteToken(jsontext.String("phase"))
+		h.WriteToken(jsontext.String(e.Phase))
+	}
+	h.WriteToken(jsontext.String("round_count"))
+	h.WriteToken(jsontext.Uint(e.RoundCount))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// BBRv3ModelUpdated logs bandwidth and RTT model updates for BBRv3.
+// This event enables tracking of BBRv3's bandwidth/RTT estimation.
+type BBRv3ModelUpdated struct {
+	MaxBW           uint64 // Estimated max bandwidth (bytes/s)
+	BwLo            uint64 // Lower bandwidth bound (bytes/s)
+	BwHi            uint64 // Upper bandwidth bound (bytes/s)
+	MinRTT          time.Duration
+	InflightHi      uint64 // Upper inflight bound (bytes)
+	InflightLo      uint64 // Lower inflight bound (bytes)
+	BDP             uint64 // Estimated BDP (bytes)
+	FullBWReached   bool
+}
+
+func (e BBRv3ModelUpdated) Name() string { return "recovery:bbr_model_updated" }
+
+func (e BBRv3ModelUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("max_bw"))
+	h.WriteToken(jsontext.Uint(e.MaxBW))
+	if e.BwLo > 0 {
+		h.WriteToken(jsontext.String("bw_lo"))
+		h.WriteToken(jsontext.Uint(e.BwLo))
+	}
+	if e.BwHi > 0 {
+		h.WriteToken(jsontext.String("bw_hi"))
+		h.WriteToken(jsontext.Uint(e.BwHi))
+	}
+	h.WriteToken(jsontext.String("min_rtt"))
+	h.WriteToken(jsontext.Float(milliseconds(e.MinRTT)))
+	if e.InflightHi > 0 {
+		h.WriteToken(jsontext.String("inflight_hi"))
+		h.WriteToken(jsontext.Uint(e.InflightHi))
+	}
+	if e.InflightLo > 0 {
+		h.WriteToken(jsontext.String("inflight_lo"))
+		h.WriteToken(jsontext.Uint(e.InflightLo))
+	}
+	h.WriteToken(jsontext.String("bdp"))
+	h.WriteToken(jsontext.Uint(e.BDP))
+	h.WriteToken(jsontext.String("full_bw_reached"))
+	h.WriteToken(jsontext.Bool(e.FullBWReached))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// BBRv3ControlUpdated logs pacing rate and cwnd changes for BBRv3.
+type BBRv3ControlUpdated struct {
+	PacingRate uint64  // Current pacing rate (bytes/s)
+	Cwnd       uint64  // Congestion window (bytes)
+	PacingGain float64 // Current pacing gain factor
+	CwndGain   float64 // Current cwnd gain factor
+}
+
+func (e BBRv3ControlUpdated) Name() string { return "recovery:bbr_control_updated" }
+
+func (e BBRv3ControlUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("pacing_rate"))
+	h.WriteToken(jsontext.Uint(e.PacingRate))
+	h.WriteToken(jsontext.String("cwnd"))
+	h.WriteToken(jsontext.Uint(e.Cwnd))
+	h.WriteToken(jsontext.String("pacing_gain"))
+	h.WriteToken(jsontext.Float(e.PacingGain))
+	h.WriteToken(jsontext.String("cwnd_gain"))
+	h.WriteToken(jsontext.Float(e.CwndGain))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// BBRv3RoundUpdated logs round boundary events for BBRv3.
+type BBRv3RoundUpdated struct {
+	RoundCount         uint64
+	LossInRound        bool
+	ECNInRound         bool
+	BytesLostInRound   uint64
+}
+
+func (e BBRv3RoundUpdated) Name() string { return "recovery:bbr_round_updated" }
+
+func (e BBRv3RoundUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("round_count"))
+	h.WriteToken(jsontext.Uint(e.RoundCount))
+	h.WriteToken(jsontext.String("loss_in_round"))
+	h.WriteToken(jsontext.Bool(e.LossInRound))
+	h.WriteToken(jsontext.String("ecn_in_round"))
+	h.WriteToken(jsontext.Bool(e.ECNInRound))
+	if e.BytesLostInRound > 0 {
+		h.WriteToken(jsontext.String("bytes_lost_in_round"))
+		h.WriteToken(jsontext.Uint(e.BytesLostInRound))
+	}
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// BBRv3ECNUpdated logs ECN alpha changes for BBRv3.
+type BBRv3ECNUpdated struct {
+	ECNAlpha    float64
+	ECNEligible bool
+}
+
+func (e BBRv3ECNUpdated) Name() string { return "recovery:bbr_ecn_updated" }
+
+func (e BBRv3ECNUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("ecn_alpha"))
+	h.WriteToken(jsontext.Float(e.ECNAlpha))
+	h.WriteToken(jsontext.String("ecn_eligible"))
+	h.WriteToken(jsontext.Bool(e.ECNEligible))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
 func (e ALPNInformation) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
