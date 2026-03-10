@@ -433,11 +433,12 @@ type BBRv3 struct {
 	// restored if the loss is later determined to be spurious.
 	// This prevents BBRv3 from permanently reducing its model bounds due to
 	// reordering that was misclassified as loss.
-	undoState      BBRState
+	undoState        BBRState
 	undoProbeBWPhase bbrProbeBWPhase
-	undoBwLo       protocol.ByteCount
-	undoInflightLo protocol.ByteCount
-	undoInflightHi protocol.ByteCount
+	undoBwLo         protocol.ByteCount
+	undoInflightLo   protocol.ByteCount
+	undoInflightHi   protocol.ByteCount
+	undoCwnd         protocol.ByteCount
 }
 
 var (
@@ -1399,6 +1400,7 @@ func (bbr *BBRv3) saveStateUponLoss() {
 	bbr.undoBwLo = bbr.bwLo
 	bbr.undoInflightLo = bbr.inflightLo
 	bbr.undoInflightHi = bbr.inflightHi
+	bbr.undoCwnd = bbr.congestionWindow
 }
 
 // OnSpuriousLossDetected implements SpuriousLossHandler.
@@ -1433,6 +1435,13 @@ func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
 		bbr.inflightHi = bbr.undoInflightHi
 	}
 
+	// Restore cwnd to max of current and saved values, then apply bounds.
+	// This allows cwnd to recover immediately rather than waiting for slow growth.
+	if bbr.undoCwnd > bbr.congestionWindow {
+		bbr.congestionWindow = bbr.undoCwnd
+	}
+	bbr.boundCwndForInflightModel()
+
 	// If we were probing bandwidth when loss occurred, return to that state.
 	// Per RFC §5.5.11.2, we restore probing state if not in ProbeRTT.
 	if bbr.state != BBRProbeRTT && bbr.state != bbr.undoState {
@@ -1445,9 +1454,6 @@ func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
 			bbr.startProbeBWUp(monotime.Now())
 		}
 	}
-
-	// Recalculate cwnd with restored bounds
-	bbr.setCwnd(bbrRateSample{})
 
 	// Emit qlog event for debugging/analysis
 	if bbr.qlogger != nil {

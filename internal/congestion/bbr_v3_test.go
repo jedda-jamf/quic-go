@@ -385,3 +385,35 @@ func TestBBRv3SpuriousLossRecoveryIdempotent(t *testing.T) {
 	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
 	require.Equal(t, protocol.ByteCount(120_000), bbr.inflightHi)
 }
+
+func TestBBRv3SpuriousLossRecoveryCwnd(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up in ProbeBW CRUISE state with known cwnd
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 1_000_000
+	bbr.minRTT = 20 * time.Millisecond
+	bbr.congestionWindow = 100_000
+	bbr.bwLo = 800_000
+	bbr.inflightLo = 100_000
+	bbr.inflightHi = 150_000
+
+	// Save state (simulating first loss in round)
+	bbr.saveStateUponLoss()
+	savedCwnd := bbr.congestionWindow
+
+	// Simulate cwnd reduction (would happen via boundCwndForInflightModel after bounds reduced)
+	bbr.inflightLo = 50_000
+	bbr.congestionWindow = 50_000 // Cwnd was capped by reduced inflightLo
+
+	require.Equal(t, protocol.ByteCount(50_000), bbr.congestionWindow)
+
+	// Spurious loss detected - should restore both bounds AND cwnd
+	bbr.OnSpuriousLossDetected(1)
+
+	// Verify cwnd was restored
+	require.Equal(t, savedCwnd, bbr.congestionWindow)
+	require.Equal(t, protocol.ByteCount(100_000), bbr.congestionWindow)
+}
