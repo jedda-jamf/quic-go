@@ -358,6 +358,14 @@ type BBRv3 struct {
 	startupECNRounds     int
 
 	// Bandwidth model: bwHi is a 2-slot windowed max filter per RFC §2.10
+	//
+	// Naming glossary (Go field → RFC term):
+	//   bwHi[0:2]  → max_bw filter slots (RFC §2.10)
+	//   bwLo       → bw_shortterm (RFC §5.5.10.2)
+	//   inflightLo → inflight_shortterm (RFC §5.5.10.2)
+	//   inflightHi → inflight_hi (RFC §5.5.10.1)
+	//   bwLatest   → bw_latest (RFC §5.5.2)
+	// Field names follow tcp_bbr.c conventions to aid cross-referencing.
 	bwHi           [MAX_BW_FILTER_SLOTS]protocol.ByteCount
 	bwLo           protocol.ByteCount
 	bwLatest       protocol.ByteCount
@@ -1155,6 +1163,10 @@ func (bbr *BBRv3) boundedBandwidth() protocol.ByteCount {
 }
 
 // checkLossTooHighInStartup checks for excessive loss in startup per tcp_bbr.c.
+// The RFC §5.3.1.3 checks "in fast recovery for at least one full round trip".
+// This implementation encodes that criterion differently: noteLoss() snapshots
+// lossRoundDelivered on first loss, and lossRoundStart only becomes true after
+// delivery crosses that point — which is the equivalent of one full round.
 func (bbr *BBRv3) checkLossTooHighInStartup(rs bbrRateSample) {
 	if bbr.fullBandwidthReached {
 		return
@@ -1709,14 +1721,18 @@ func (bbr *BBRv3) setPacingRateWithGain(gain float64) {
 func (bbr *BBRv3) setSendQuantum() {
 	if bbr.pacingRate == 0 {
 		bbr.sendQuantum = max(2*bbr.maxDatagramSize, bbr.maxDatagramSize)
-		bbr.offloadBudget = 3 * bbr.sendQuantum
+		// Per RFC §5.5.8.2: QUIC (non-offloaded) uses offload_budget = send_quantum.
+		// TCP (with TSO/GSO offloading) uses 3 * send_quantum per §5.5.8.1.
+		bbr.offloadBudget = bbr.sendQuantum
 		return
 	}
 	q := protocol.ByteCount(uint64(bbr.pacingRate) * uint64(time.Millisecond) / uint64(time.Second))
 	q = min(q, protocol.ByteCount(64*1024))
 	q = max(q, 2*bbr.maxDatagramSize)
 	bbr.sendQuantum = q
-	bbr.offloadBudget = 3 * q
+	// Per RFC §5.5.8.2: QUIC (non-offloaded) uses offload_budget = send_quantum.
+	// TCP (with TSO/GSO offloading) uses 3 * send_quantum per §5.5.8.1.
+	bbr.offloadBudget = q
 }
 
 func (bbr *BBRv3) setCwnd(rs bbrRateSample) {
@@ -1899,6 +1915,10 @@ func (bbr *BBRv3) isCwndLimited(bytesInFlight protocol.ByteCount) bool {
 		return true
 	}
 	available := bbr.congestionWindow - bytesInFlight
+	// Allow a small packet-scheduling tolerance below cwnd. In quic-go the pacer
+	// and packetization path can leave a few packets of slack even when the flow
+	// is effectively cwnd-limited. The maxBurstPackets (3) headroom is ~0.4% of
+	// typical ProbeBW cwnd and does not materially affect throughput.
 	return available <= maxBurstPackets*bbr.maxDatagramSize
 }
 
