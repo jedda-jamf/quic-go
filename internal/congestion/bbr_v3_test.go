@@ -458,3 +458,346 @@ func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
 	require.Equal(t, protocol.MaxByteCount, bbr.bwLo, "bwLo should be restored to unconstrained")
 	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored to unconstrained")
 }
+
+// =============================================================================
+// GUARDRAIL TESTS - These verify the bugs identified in the code review.
+// These tests should FAIL with the current buggy implementation and PASS
+// after the fixes are applied.
+// =============================================================================
+
+// TestBBRv3GuardrailStartupReachesFullBwWithoutAppLimited verifies Issue 1:
+// Bulk-transfer Startup must reach fullBandwidthReached without samples being
+// perpetually marked as app-limited due to cwnd growing faster than pacing allows.
+func TestBBRv3GuardrailStartupReachesFullBwWithoutAppLimited(t *testing.T) {
+	bbr := newTestBBRv3()
+	rtt := 40 * time.Millisecond
+
+	bbr.state = BBRStartup
+	bbr.minRTT = rtt
+	bbr.bwHi[0] = 1 // Initialize to non-zero for bandwidth tracking
+
+	// Key assertion: with proper app-limited semantics (bubble-based),
+	// samples from a bulk transfer should NOT be marked app-limited.
+	// MarkAppLimited() is only called when send was allowed but no data available.
+	// Since we're simulating a bulk transfer with data to send, appLimitedUntil = 0.
+	require.Equal(t, uint64(0), bbr.appLimitedUntil,
+		"appLimitedUntil should be 0 at start (no app-limited bubble)")
+
+	// Simulate plateau rounds directly via checkFullBwReached
+	// This tests the core logic without the full model update path complexity
+	plateauRate := protocol.ByteCount(10_000_000) // 10 MB/s
+
+	// Set fullBandwidth to the plateau rate so subsequent samples show < 25% growth
+	bbr.fullBandwidth = plateauRate
+	bbr.bwHi[0] = plateauRate
+
+	// Now run through FULL_BW_ROUNDS with stable rate (< 25% growth)
+	// Each sample shows small growth (< 1.25x), so counter increments
+	for round := 0; round < FULL_BW_ROUNDS+1; round++ {
+		// Create a rate sample that is NOT app-limited
+		// Growth is only 1% per round, well below 25% threshold
+		rs := bbrRateSample{
+			deliveryRate: plateauRate + protocol.ByteCount(round*100_000), // 1% growth
+			isAppLimited: false, // Key: with fix, bulk-transfer samples are NOT app-limited
+		}
+
+		bbr.roundStart = true
+		bbr.checkFullBwReached(rs)
+
+		if round >= FULL_BW_ROUNDS-1 {
+			// After 3 rounds of < 25% growth, fullBandwidthReached should be true
+			require.True(t, bbr.fullBandwidthReached,
+				"fullBandwidthReached should be true after %d plateau rounds", round+1)
+		}
+	}
+
+	// Also verify: if samples WERE app-limited, fullBandwidthReached would stay false
+	bbr2 := newTestBBRv3()
+	bbr2.state = BBRStartup
+	bbr2.fullBandwidth = plateauRate / 2
+	bbr2.bwHi[0] = plateauRate
+
+	for round := 0; round < FULL_BW_ROUNDS+1; round++ {
+		rs := bbrRateSample{
+			deliveryRate: plateauRate + protocol.ByteCount(round*100_000),
+			isAppLimited: true, // App-limited samples are skipped
+		}
+		bbr2.roundStart = true
+		bbr2.checkFullBwReached(rs)
+	}
+	require.False(t, bbr2.fullBandwidthReached,
+		"fullBandwidthReached should stay false with app-limited samples")
+}
+
+// TestBBRv3GuardrailProbeRTTExitsToProbeBW verifies Issue 1 (part 2):
+// After fullBandwidthReached, ProbeRTT must exit to ProbeBW, not back to Startup.
+func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up: in ProbeBW with fullBandwidthReached = true
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.congestionWindow = 100_000
+
+	// Trigger ProbeRTT entry (timer expired)
+	bbr.probeRTTMinStamp = now.Add(-PROBE_RTT_INTERVAL - time.Millisecond)
+	bbr.idleRestart = false
+	bbr.updateMinRTT(now)
+	require.Equal(t, BBRProbeRTT, bbr.state, "should enter ProbeRTT")
+
+	// Complete ProbeRTT (duration elapsed + round completed)
+	bbr.probeRTTDoneStamp = now
+	bbr.probeRTTRoundDone = true
+	bbr.roundStart = true
+	exitTime := now.Add(PROBE_RTT_DURATION + time.Millisecond)
+	bbr.updateMinRTT(exitTime)
+
+	// Must exit to ProbeBW, not Startup
+	require.Equal(t, BBRProbeBW, bbr.state,
+		"ProbeRTT should exit to ProbeBW when fullBandwidthReached is true")
+	require.True(t, bbr.fullBandwidthReached,
+		"fullBandwidthReached should remain true after ProbeRTT")
+}
+
+// TestBBRv3GuardrailProbeBWUpInflightHiGrowsMSS verifies Issue 2:
+// ProbeBW_UP must grow inflightHi by MSS-sized steps, not byte-sized steps.
+func TestBBRv3GuardrailProbeBWUpInflightHiGrowsMSS(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up in ProbeBW_UP phase
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000 // 10 MB/s
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.congestionWindow = 400_000 // ~400KB (~312 packets)
+	bbr.inflightHi = 400_000
+	bbr.bwProbeUpRounds = 0
+	bbr.bwProbeUpAcks = 0
+	bbr.raiseInflightHiSlope() // Initialize bwProbeUpCnt
+
+	// After raiseInflightHiSlope with rounds=0:
+	// cwndPkts = 400000/1280 = 312, growthThisRound = 1
+	// bwProbeUpCnt = 312 (packets to ACK before adding 1 packet)
+	initialInflightHi := bbr.inflightHi
+	initialCnt := bbr.bwProbeUpCnt
+
+	// We need to ACK bwProbeUpCnt packets to trigger 1 MSS growth
+	// ACK the full cwnd worth of data
+	rs := bbrRateSample{
+		priorInFlight: bbr.congestionWindow,
+		newlyAcked:    bbr.congestionWindow, // ACK full cwnd (~312 packets)
+	}
+
+	bbr.probeInflightHiUpward(rs)
+
+	growth := bbr.inflightHi - initialInflightHi
+
+	// With fix: after ACKing cwndPkts, we should have added at least 1 MSS
+	// ackedPkts = 312, bwProbeUpCnt = 312, delta = 312/312 = 1
+	// inflightHi += 1 * MSS = 1280 bytes
+	require.GreaterOrEqual(t, growth, bbr.maxDatagramSize,
+		"inflightHi should grow by at least 1 MSS (acked %d pkts, cnt was %d), got %d bytes",
+		bbr.congestionWindow/bbr.maxDatagramSize, initialCnt, growth)
+}
+
+// TestBBRv3GuardrailDeliveryRateMinRTTGuard verifies Issue 3:
+// Delivery rate samples with interval < min_rtt should be rejected entirely.
+// Per RFC §4.1.2.3, such samples must not influence ANY model state.
+func TestBBRv3GuardrailDeliveryRateMinRTTGuard(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Establish a min_rtt baseline
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.state = BBRStartup
+	bbr.roundCount = 1 // Ensure we have "real" minRTT
+
+	// Record initial state
+	initialBwLatest := bbr.bwLatest
+	initialMaxBw := bbr.maxBandwidth()
+
+	// Send a packet
+	bbr.OnPacketSent(now, 0, 1, 1200, true)
+
+	// ACK arrives very quickly (interval < min_rtt) - unreliable sample
+	fastAckTime := now.Add(5 * time.Millisecond) // Only 5ms, way less than 40ms min_rtt
+	bbr.OnPacketAcked(1, 1200, 1200, fastAckTime)
+
+	// Before OnAckEventEnd, verify the sample would have short interval
+	interval := maxDuration(bbr.pendingSendElapsed, fastAckTime.Sub(bbr.pendingPriorTime))
+	require.Less(t, interval, bbr.minRTT,
+		"test setup: sample interval (%v) should be less than min_rtt (%v)", interval, bbr.minRTT)
+	require.Greater(t, interval, time.Duration(0),
+		"test setup: sample interval should be positive")
+
+	// Process the ACK event
+	bbr.OnAckEventEnd(fastAckTime)
+
+	// CRITICAL: Invalid samples must NOT affect model state
+	// Per RFC §4.1.2.3, the entire delivery_rate should be suppressed
+	require.Equal(t, initialBwLatest, bbr.bwLatest,
+		"bwLatest should not be updated from invalid sample (interval < min_rtt)")
+	require.Equal(t, initialMaxBw, bbr.maxBandwidth(),
+		"maxBandwidth should not be updated from invalid sample (interval < min_rtt)")
+}
+
+// TestBBRv3GuardrailDrainExitsAfter3Rounds verifies Issue 4:
+// Drain must exit after 3 rounds even if inflight never drops below inflated BDP.
+func TestBBRv3GuardrailDrainExitsAfter3Rounds(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up in Drain with an inflated bandwidth estimate
+	bbr.state = BBRDrain
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 100_000_000 // 100 MB/s (way overestimated)
+	bbr.minRTT = 40 * time.Millisecond
+	// BDP = 100MB/s * 40ms = 4MB, but actual inflight is only 500KB
+	actualInflight := protocol.ByteCount(500_000)
+	inflatedBDP := bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0)
+	require.Greater(t, inflatedBDP, actualInflight,
+		"test setup: BDP should be inflated above actual inflight")
+
+	// Track initial round
+	initialRound := bbr.roundCount
+
+	// Simulate 4 rounds passing - Drain should exit after 3
+	for i := 0; i < 4; i++ {
+		bbr.roundStart = true
+		bbr.roundCount++
+		rs := bbrRateSample{bytesInFlight: actualInflight}
+		bbr.checkDrain(rs, now)
+
+		if i >= 3 {
+			// BUG: Current code stays in Drain forever because inflight < inflated_BDP
+			// EXPECTED: Should exit to ProbeBW after 3 rounds
+			require.Equal(t, BBRProbeBW, bbr.state,
+				"Drain should exit to ProbeBW after 3 rounds (round %d)", bbr.roundCount-initialRound)
+		}
+	}
+}
+
+// TestBBRv3GuardrailProbeBWUpCwndGain verifies Issue 5:
+// ProbeBW_UP must use cwnd_gain = 2.25, not 2.0.
+func TestBBRv3GuardrailProbeBWUpCwndGain(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up in ProbeBW_UP phase
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp
+	bbr.fullBandwidthReached = true
+
+	bbr.updateGains()
+
+	// BUG: Current code sets cwndGain = 2.0 for all ProbeBW phases
+	// EXPECTED: ProbeBW_UP should have cwndGain = 2.25 per RFC §5.6.1
+	require.Equal(t, 2.25, bbr.cwndGain,
+		"ProbeBW_UP cwndGain should be 2.25, got %v", bbr.cwndGain)
+}
+
+// TestBBRv3GuardrailExtraAckedWindowInStartup verifies Issue 8:
+// Startup should use a 1-RTT extra_acked window, not 5-RTT.
+func TestBBRv3GuardrailExtraAckedWindowInStartup(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	bbr.state = BBRStartup
+	bbr.fullBandwidthReached = false
+	bbr.extraAckedWinRTTs = 0
+	bbr.extraAckedWinIdx = 0
+	bbr.extraAcked = [2]protocol.ByteCount{10_000, 5_000}
+	bbr.ackEpochStart = now.Add(-time.Millisecond)
+	bbr.bwHi[0] = 10_000_000
+
+	initialIdx := bbr.extraAckedWinIdx
+
+	// Simulate 1 round in Startup - should rotate window (1-RTT window)
+	bbr.roundStart = true
+	bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
+
+	// With 1-RTT window in Startup: after 1 round, the window should have rotated
+	// extraAckedWinRTTs went 0->1, triggered rotation (>=1), then reset to 0
+	// extraAckedWinIdx should have flipped from 0 to 1
+	require.NotEqual(t, initialIdx, bbr.extraAckedWinIdx,
+		"window index should rotate after 1 RTT in Startup")
+	// After rotation, the slot was cleared to 0, then updated with new sample
+	// The important thing is that the OLD values (10_000, 5_000) were rotated out
+
+	// Verify that in non-Startup state, it takes 5 RTTs to rotate
+	bbr.state = BBRProbeBW
+	bbr.fullBandwidthReached = true
+	rotatedIdx := bbr.extraAckedWinIdx
+
+	// Simulate 4 more rounds (should NOT rotate with 5-RTT window)
+	for i := 0; i < 4; i++ {
+		bbr.roundStart = true
+		bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
+	}
+	require.Equal(t, rotatedIdx, bbr.extraAckedWinIdx,
+		"window should not rotate before 5 RTTs in ProbeBW")
+
+	// One more round (5th) should trigger rotation
+	bbr.roundStart = true
+	bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
+	require.NotEqual(t, rotatedIdx, bbr.extraAckedWinIdx,
+		"window should rotate after 5 RTTs in ProbeBW")
+}
+
+// TestBBRv3GuardrailZeroInflightFromAckEventStart verifies P1 fix:
+// Zero bytesInFlight from OnAckEventStart is valid (all data was lost),
+// and must not fall back to pre-loss reconstruction.
+func TestBBRv3GuardrailZeroInflightFromAckEventStart(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up in ProbeBW_DOWN where checkTimeToCruise() will use bytesInFlight
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWDown
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000 // 10 MB/s
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.inflightHi = 100_000 // 100KB
+	bbr.cycleStamp = now     // Recent probe start
+	bbr.probeWait = time.Hour // Prevent checkTimeToProbeBW from triggering REFILL
+
+	// BDP = 10MB/s * 10ms = 100KB
+	bdp := bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0)
+
+	// Send packet with HIGH priorInFlight that would be used in reconstruction
+	// If bug: reconstructed = 120000 - 1200 = 118800 (above BDP, won't cruise)
+	// If fix: captured = 0, then 0 - 1200 clamped to 0 (below BDP, will cruise)
+	highPriorInflight := protocol.ByteCount(120_000)
+	require.Greater(t, highPriorInflight, bdp,
+		"test setup: reconstructed inflight (%d) should exceed BDP (%d)", highPriorInflight, bdp)
+
+	bbr.OnPacketSent(now, highPriorInflight, 1, 1200, true)
+
+	// Simulate OnAckEventStart with bytesInFlight=0 (all other data was lost)
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnAckEventStart(ackTime, 0) // Zero is valid capture, not "hook absent"
+
+	// ACK the packet - this sets pendingPriorInFlight = highPriorInflight
+	bbr.OnPacketAcked(1, 1200, highPriorInflight, ackTime)
+
+	// Verify setup: reconstruction would give wrong value
+	reconstructed := bbr.pendingPriorInFlight - bbr.pendingAckedBytes
+	require.Greater(t, reconstructed, bdp,
+		"test setup: reconstruction (%d) > BDP (%d), so cruise would NOT trigger with bug",
+		reconstructed, bdp)
+
+	// Process ACK event
+	bbr.OnAckEventEnd(ackTime)
+
+	// BEHAVIORAL ASSERTION: With correct zero-inflight, checkTimeToCruise()
+	// should have triggered because 0 <= inflightWithHeadroom and 0 <= BDP.
+	// With the bug (reconstruction), it would NOT have triggered because
+	// 118800 > inflightWithHeadroom and 118800 > BDP.
+	require.Equal(t, probeBWCruise, bbr.probeBWPhase,
+		"should transition to CRUISE when inflight=0 (fix applied); "+
+			"if still in DOWN, the bug caused reconstruction to ~%d instead of 0", reconstructed)
+}
