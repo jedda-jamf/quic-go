@@ -13,12 +13,9 @@ import (
 )
 
 // TODO(bbr): App-limited detection for ACK/timer-triggered send resumption.
-// Per RFC draft-ietf-ccwg-bbr-05 §4.1.1.3, the connection should be marked
-// app-limited when a send opportunity exists but there is no data to send.
-// Currently, isAppLimited is derived from cwnd utilization rather than true
-// application-layer idleness. This is a known RFC compliance gap that does
-// not affect the core congestion control correctness but may cause samples
-// to be incorrectly classified in edge cases.
+// The core app-limited "bubble" semantics are implemented, but RFC
+// draft-ietf-ccwg-bbr-05 §4.1.1.3 also calls for checking for app-limited
+// send opportunities on ACK/timer-driven send resumption paths.
 
 // BBRv3 Constants
 //
@@ -330,11 +327,11 @@ type bbrRateSample struct {
 // - IETF specification: draft-ietf-ccwg-bbr-05
 //
 // QUIC Adaptation Notes:
-// - QUIC ackhandler invokes callbacks per-packet, while Linux BBR updates
-//   its model once per ACK event. We emulate this by coalescing per-packet
-//   callbacks by ACK timestamp and running one model update at OnAckEventEnd().
-// - C.SMSS maps to maxDatagramSize (QUIC datagram size) per RFC §2.1
-// - No TSO/GRO offload budget complexity (QUIC runs in userspace)
+//   - QUIC ackhandler invokes callbacks per-packet, while Linux BBR updates
+//     its model once per ACK event. We emulate this by coalescing per-packet
+//     callbacks by ACK timestamp and running one model update at OnAckEventEnd().
+//   - C.SMSS maps to maxDatagramSize (QUIC datagram size) per RFC §2.1
+//   - No TSO/GRO offload budget complexity (QUIC runs in userspace)
 type BBRv3 struct {
 	rttStats *utils.RTTStats
 	pacer    *pacer
@@ -373,15 +370,15 @@ type BBRv3 struct {
 	nextRoundDelivered uint64
 	roundStart         bool
 
-	lossRoundDelivered uint64
-	lossRoundStart     bool
-	lossInRound        bool
-	ecnInRound         bool
-	lossInCycle        bool
-	ecnInCycle         bool
-	lossEventsInRound        int
-	lossEventCountedThisACK  bool // Ensures we count at most one loss event per ACK event
-	bytesLostInRound         protocol.ByteCount
+	lossRoundDelivered      uint64
+	lossRoundStart          bool
+	lossInRound             bool
+	ecnInRound              bool
+	lossInCycle             bool
+	ecnInCycle              bool
+	lossEventsInRound       int
+	lossEventCountedThisACK bool // Ensures we count at most one loss event per ACK event
+	bytesLostInRound        protocol.ByteCount
 
 	// Drain state tracking for 3-round fallback (Issue 4)
 	drainRounds int
@@ -1254,7 +1251,7 @@ func (bbr *BBRv3) updateCyclePhase(rs bbrRateSample, now monotime.Time) {
 	case probeBWRefill:
 		if bbr.roundStart {
 			bbr.bwProbeSamples = true
-			bbr.startProbeBWUp(now)
+			bbr.startProbeBWUp(now, rs.deliveryRate)
 		}
 	case probeBWUp:
 		if bbr.prevProbeTooHigh && rs.bytesInFlight >= bbr.inflightHi {
@@ -1429,11 +1426,11 @@ func (bbr *BBRv3) startProbeBWRefill(now monotime.Time, probeUpRounds uint8) {
 	bbr.phaseStartStamp = now
 }
 
-func (bbr *BBRv3) startProbeBWUp(now monotime.Time) {
+func (bbr *BBRv3) startProbeBWUp(now monotime.Time, sampleBW protocol.ByteCount) {
 	bbr.ackPhase = ackPhaseProbeStarting
 	bbr.startRoundNow()
 	bbr.resetFullBw()
-	bbr.fullBandwidth = bbr.bwLatest
+	bbr.fullBandwidth = sampleBW
 	bbr.probeBWPhase = probeBWUp
 	bbr.phaseStartStamp = now
 	bbr.bwProbeSamples = true
@@ -1482,12 +1479,13 @@ func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
 		bbr.probeRTTRoundDone = false
 		bbr.ackPhase = ackPhaseProbeStopping
 		bbr.startRoundNow()
-		// Per RFC §5.3.4.3: mark connection app-limited during ProbeRTT.
-		// The reduced cwnd means we're intentionally under-utilizing capacity.
-		bbr.MarkAppLimited(bbr.bytesInFlightAfterACK())
 	}
 
 	if bbr.state == BBRProbeRTT {
+		// RFC §5.3.4.3 / tcp_bbr.c:bbr_update_min_rtt() refreshes the
+		// app-limited bubble on every ACK during ProbeRTT so the low-rate
+		// drain/refill samples do not poison max_bw.
+		bbr.MarkAppLimited(bbr.bytesInFlightAfterACK())
 		probeRTTCwnd := bbr.probeRTTCwnd()
 		if bbr.probeRTTDoneStamp.IsZero() && bbr.bytesInFlightAfterACK() <= probeRTTCwnd {
 			bbr.probeRTTDoneStamp = now.Add(PROBE_RTT_DURATION)
@@ -1598,7 +1596,7 @@ func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
 			bbr.cwndGain = STARTUP_CWND_GAIN
 			bbr.fullBandwidthReached = false
 		} else if bbr.undoState == BBRProbeBW && bbr.undoProbeBWPhase == probeBWUp {
-			bbr.startProbeBWUp(monotime.Now())
+			bbr.startProbeBWUp(monotime.Now(), bbr.bwLatest)
 		}
 	}
 

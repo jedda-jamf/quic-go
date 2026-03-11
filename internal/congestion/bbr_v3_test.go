@@ -294,7 +294,7 @@ func TestBBRv3SpuriousLossRecovery(t *testing.T) {
 	bbr.adaptLowerBounds(bbrRateSample{})
 
 	// Verify bounds were reduced (by BETA_REDUCTION = 30%)
-	expectedBwLo := protocol.ByteCount(float64(800_000) * 0.70)       // 560_000
+	expectedBwLo := protocol.ByteCount(float64(800_000) * 0.70)      // 560_000
 	expectedInflightLo := protocol.ByteCount(float64(80_000) * 0.70) // 56_000
 	require.Equal(t, max(bbr.bwLatest, expectedBwLo), bbr.bwLo)
 	require.Equal(t, max(bbr.inflightLatest, expectedInflightLo), bbr.inflightLo)
@@ -443,7 +443,7 @@ func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
 
 	// Simulate adaptLowerBounds reducing bounds (as happens in CRUISE after loss)
 	// This is what initLowerBounds + loss reduction does
-	bbr.bwLo = 12_000_000   // Reduced to 12 MB/s = 96 Mbps
+	bbr.bwLo = 12_000_000    // Reduced to 12 MB/s = 96 Mbps
 	bbr.inflightLo = 600_000 // Reduced inflight
 
 	// Verify bounds are now constrained
@@ -498,7 +498,7 @@ func TestBBRv3GuardrailStartupReachesFullBwWithoutAppLimited(t *testing.T) {
 		// Growth is only 1% per round, well below 25% threshold
 		rs := bbrRateSample{
 			deliveryRate: plateauRate + protocol.ByteCount(round*100_000), // 1% growth
-			isAppLimited: false, // Key: with fix, bulk-transfer samples are NOT app-limited
+			isAppLimited: false,                                           // Key: with fix, bulk-transfer samples are NOT app-limited
 		}
 
 		bbr.roundStart = true
@@ -563,6 +563,37 @@ func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
 		"fullBandwidthReached should remain true after ProbeRTT")
 }
 
+// TestBBRv3GuardrailProbeRTTRefreshesAppLimitedBubble verifies the ProbeRTT
+// RFC requirement to mark the connection app-limited on every ACK while
+// handling ProbeRTT, not just once on entry.
+func TestBBRv3GuardrailProbeRTTRefreshesAppLimitedBubble(t *testing.T) {
+	rttStats := utils.NewRTTStats()
+	rttStats.UpdateRTT(25*time.Millisecond, 0)
+	bbr := NewBBRV3(DefaultClock{}, rttStats, nil, initialMaxDatagramSize, false, nil)
+	now := monotime.Now()
+
+	bbr.state = BBRProbeRTT
+	bbr.totalBytesAcked = 50_000
+	bbr.appLimitedUntil = 0 // Simulate the ProbeRTT bubble having expired on a prior ACK.
+	bbr.pendingPriorInFlight = 12 * bbr.maxDatagramSize
+	bbr.pendingAckedBytes = 4 * bbr.maxDatagramSize
+
+	expectedBubble := bbr.totalBytesAcked + uint64(8*bbr.maxDatagramSize)
+	bbr.updateMinRTT(now)
+
+	require.Equal(t, expectedBubble, bbr.appLimitedUntil,
+		"ProbeRTT ACK handling should refresh the app-limited bubble to delivered+inflight")
+
+	packetNumber := protocol.PacketNumber(1)
+	bytesInFlight := 9 * bbr.maxDatagramSize
+	bbr.OnPacketSent(now, bytesInFlight, packetNumber, bbr.maxDatagramSize, true)
+
+	st, ok := bbr.sentPackets[packetNumber]
+	require.True(t, ok, "sent packet state should be tracked")
+	require.True(t, st.isAppLimited,
+		"packets sent after a ProbeRTT ACK should remain app-limited until the bubble drains")
+}
+
 // TestBBRv3GuardrailProbeBWUpInflightHiGrowsMSS verifies Issue 2:
 // ProbeBW_UP must grow inflightHi by MSS-sized steps, not byte-sized steps.
 func TestBBRv3GuardrailProbeBWUpInflightHiGrowsMSS(t *testing.T) {
@@ -603,6 +634,28 @@ func TestBBRv3GuardrailProbeBWUpInflightHiGrowsMSS(t *testing.T) {
 	require.GreaterOrEqual(t, growth, bbr.maxDatagramSize,
 		"inflightHi should grow by at least 1 MSS (acked %d pkts, cnt was %d), got %d bytes",
 		bbr.congestionWindow/bbr.maxDatagramSize, initialCnt, growth)
+}
+
+// TestBBRv3GuardrailProbeBWUpSeedsFromCurrentSample verifies Issue 9:
+// ProbeBW_UP should seed the full-bandwidth detector from the current ACK's
+// delivery-rate sample, not stale bwLatest from earlier cycles.
+func TestBBRv3GuardrailProbeBWUpSeedsFromCurrentSample(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWRefill
+	bbr.fullBandwidthReached = true
+	bbr.bwLatest = 5_000_000
+	bbr.fullBandwidth = 1_000_000
+
+	rs := bbrRateSample{deliveryRate: 15_000_000}
+	bbr.roundStart = true
+	bbr.updateCyclePhase(rs, now)
+
+	require.Equal(t, probeBWUp, bbr.probeBWPhase, "REFILL should transition to UP on round start")
+	require.Equal(t, rs.deliveryRate, bbr.fullBandwidth,
+		"ProbeBW_UP should seed fullBandwidth from the current delivery-rate sample")
 }
 
 // TestBBRv3GuardrailDeliveryRateMinRTTGuard verifies Issue 3:
@@ -761,8 +814,8 @@ func TestBBRv3GuardrailZeroInflightFromAckEventStart(t *testing.T) {
 	bbr.fullBandwidthReached = true
 	bbr.bwHi[0] = 10_000_000 // 10 MB/s
 	bbr.minRTT = 10 * time.Millisecond
-	bbr.inflightHi = 100_000 // 100KB
-	bbr.cycleStamp = now     // Recent probe start
+	bbr.inflightHi = 100_000  // 100KB
+	bbr.cycleStamp = now      // Recent probe start
 	bbr.probeWait = time.Hour // Prevent checkTimeToProbeBW from triggering REFILL
 
 	// BDP = 10MB/s * 10ms = 100KB
