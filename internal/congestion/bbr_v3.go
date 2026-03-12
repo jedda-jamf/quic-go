@@ -1609,9 +1609,10 @@ func (bbr *BBRv3) saveStateUponLoss() {
 // to their pre-loss values to undo loss-driven reductions that were triggered
 // by reordering rather than actual congestion.
 func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.PacketNumber) {
-	// Threshold check: only recover if the branch is configured to react to
-	// per-packet spurious loss callbacks.
-	if 1 < spuriousLossRecoveryThreshold {
+	// The current transport hook delivers one callback per spuriously lost
+	// packet, so thresholds greater than 1 effectively disable this recovery
+	// path until BBR grows an explicit accumulator.
+	if spuriousLossRecoveryThreshold > 1 {
 		return
 	}
 
