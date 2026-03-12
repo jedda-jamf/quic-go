@@ -188,10 +188,10 @@ const (
 	// See also: tcp_bbr.c:bbr_bw_probe_max_rounds = 63
 	BW_PROBE_MAX_ROUNDS = 63
 
-	// DRAIN_MAX_ROUNDS = 3 per tcp_bbr.c
-	// Fallback exit from Drain state if inflight doesn't drop below BDP.
-	// Prevents getting stuck in Drain if inflight never drains (e.g., app-limited).
-	// See also: tcp_bbr.c BBR_DRAIN_N_RTTS concept
+	// DRAIN_MAX_ROUNDS = 3 per RFC draft-ietf-ccwg-bbr-05 §5.3.2
+	// Fallback exit from Drain if inflight has not dropped below BDP within 3 rounds.
+	// Handles cases where bandwidth was overestimated in Startup (e.g., due to competing
+	// flows), preventing the connection from stalling in Drain indefinitely.
 	DRAIN_MAX_ROUNDS = 3
 
 	// EXTRA_ACKED_WIN_RTS_STARTUP = 1 per RFC draft-ietf-ccwg-bbr-05 §5.5.9.
@@ -381,7 +381,7 @@ type BBRv3 struct {
 	lossEventCountedThisACK bool // Ensures we count at most one loss event per ACK event
 	bytesLostInRound        protocol.ByteCount
 
-	// Drain state tracking for 3-round fallback (Issue 4)
+	// Drain state round counter for 3-round fallback exit per RFC §5.3.2.
 	drainRounds int
 
 	totalBytesSent    uint64
@@ -720,9 +720,9 @@ func (bbr *BBRv3) OnCongestionEvent(
 	bbr.totalBytesLost += uint64(lostBytes)
 	bbr.bytesLostInRound += lostBytes
 	bbr.noteLoss()
-	// Issue 7: Count loss events per ACK event, not per packet.
-	// Per tcp_bbr.c, startup loss exit uses event count (one per ACK frame with loss),
-	// not packet count. Multiple lost packets in the same ACK event = one event.
+	// Count loss events per loss-detection pass, not per packet, per RFC §5.3.1.3.
+	// Startup loss exit requires BBRStartupFullLossCnt=6 discontiguous loss events
+	// per round trip. Multiple packets lost in the same pass count as one event.
 	if !bbr.lossEventCountedThisACK && bbr.lossEventsInRound < math.MaxInt32 {
 		bbr.lossEventsInRound++
 		bbr.lossEventCountedThisACK = true
@@ -1253,11 +1253,11 @@ func (bbr *BBRv3) resetFullBw() {
 func (bbr *BBRv3) checkDrain(rs bbrRateSample, now monotime.Time) {
 	if bbr.state == BBRStartup && bbr.fullBandwidthReached {
 		bbr.state = BBRDrain
-		bbr.drainRounds = 0 // Issue 4: Reset drain round counter on entry
+		bbr.drainRounds = 0 // Reset drain round counter on Drain entry per RFC §5.3.2.
 		bbr.resetCongestionSignals()
 	}
 	if bbr.state == BBRDrain {
-		// Issue 4: Track rounds in Drain for fallback exit.
+		// Track rounds in Drain for the 3-round fallback exit per RFC §5.3.2.
 		if bbr.roundStart {
 			bbr.drainRounds++
 		}
@@ -1624,10 +1624,8 @@ func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.Pac
 
 	// Restore bounds to max of current and saved values per RFC §5.5.11.2:
 	//   BBR.bw_shortterm = max(BBR.bw_shortterm, BBR.undo_bw_shortterm)
-	// Using simple > comparison implements max() correctly. Critically, if the
-	// saved value is MaxByteCount (meaning bounds were unconstrained before loss),
-	// we restore to MaxByteCount to remove the constraint. The previous check
-	// `!= MaxByteCount` incorrectly prevented restoring unconstrained state.
+	// If the saved value is MaxByteCount (bounds were unconstrained before loss),
+	// this restores the unconstrained state, fully reversing the loss-driven reduction.
 	if bbr.undoBwLo > bbr.bwLo {
 		bbr.bwLo = bbr.undoBwLo
 	}
