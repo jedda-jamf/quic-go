@@ -113,12 +113,7 @@ func newCubicSender(
 		qlogger:                    qlogger,
 		maxDatagramSize:            initialMaxDatagramSize,
 	}
-	c.pacer = newPacer(func() Bandwidth {
-		// Cubic/Reno overpaces by 25% to compensate for RTT variations and ensure
-		// the congestion window is fully utilized. This results in sending packets
-		// as acknowledgments are received rather than when timers fire.
-		return c.BandwidthEstimate() * 5 / 4
-	})
+	c.pacer = newPacer(c.BandwidthEstimate)
 	if c.qlogger != nil {
 		c.lastState = qlog.CongestionStateSlowStart
 		c.qlogger.RecordEvent(qlog.CongestionStateUpdated{

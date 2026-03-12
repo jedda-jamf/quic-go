@@ -36,9 +36,4 @@ type SentPacketHandler interface {
 	OnLossDetectionTimeout(now monotime.Time) error
 
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
-
-	// MarkAppLimited notifies the congestion controller that the application
-	// had a send opportunity but no data to send. This implements RFC §4.1.1.3
-	// "app-limited" bubble semantics for BBRv3.
-	MarkAppLimited()
 }

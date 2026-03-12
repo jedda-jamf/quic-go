@@ -693,6 +693,7 @@ func TestSentPacketHandlerPTO(t *testing.T) {
 func testSentPacketHandlerPTO(t *testing.T, encLevel protocol.EncryptionLevel, ptoMode SendMode) {
 	var packets packetTracker
 	var eventRecorder events.Recorder
+	cong := &ptoTrackingSendAlgorithm{}
 
 	rttStats := utils.NewRTTStats()
 	rttStats.SetMaxAckDelay(25 * time.Millisecond)
@@ -709,7 +710,7 @@ func testSentPacketHandlerPTO(t *testing.T, encLevel protocol.EncryptionLevel, p
 		nil,
 		protocol.PerspectiveServer,
 		&eventRecorder,
-		nil, // customCC: use default NewReno
+		cong,
 		utils.DefaultLogger,
 	)
 

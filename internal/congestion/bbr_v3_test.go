@@ -75,6 +75,47 @@ func TestBBRv3StartupExitByExcessiveECN(t *testing.T) {
 	require.GreaterOrEqual(t, bbr.startupECNRounds, FULL_ECN_ROUNDS)
 }
 
+// TestBBRv3GuardrailAckAdvancesFirstSendTime verifies RFC §4.1.2.3:
+// after ACKing the newest packet in an ACK event, future packets must inherit
+// that packet's send time as the new first_send_time. Without this, send_elapsed
+// grows from connection start and delivery-rate samples are increasingly
+// underestimated over time.
+func TestBBRv3GuardrailAckAdvancesFirstSendTime(t *testing.T) {
+	bbr := newTestBBRv3()
+	t0 := monotime.Now()
+
+	// Keep one packet in flight across the ACK event so OnPacketSent can't fall
+	// back to the "bytesInFlight == 0" path to refresh firstSentTime.
+	bbr.OnPacketSent(t0, 1200, 1, 1200, true)
+	bbr.OnPacketSent(t0.Add(10*time.Millisecond), 2400, 2, 1200, true)
+	bbr.OnPacketSent(t0.Add(20*time.Millisecond), 3600, 3, 1200, true)
+
+	ack1 := t0.Add(100 * time.Millisecond)
+	bbr.OnAckEventStart(ack1, 3600)
+	bbr.OnPacketAcked(1, 1200, 3600, ack1)
+	bbr.OnPacketAcked(2, 1200, 2400, ack1)
+	bbr.OnAckEventEnd(ack1)
+
+	require.Equal(t, t0.Add(10*time.Millisecond), bbr.firstSentTime,
+		"ACK processing should advance firstSentTime to the newest acked packet's send time")
+
+	// Send a new packet while packet 3 is still in flight; it must inherit the
+	// updated firstSentTime from packet 2's send time.
+	send4 := t0.Add(101 * time.Millisecond)
+	bbr.OnPacketSent(send4, 2400, 4, 1200, true)
+	require.Equal(t, t0.Add(10*time.Millisecond), bbr.sentPackets[4].firstSentTime,
+		"newly sent packets should inherit the refreshed firstSentTime")
+
+	// When packet 4 is later ACKed, its send_elapsed should be measured from the
+	// refreshed firstSentTime, not from connection start.
+	ack2 := t0.Add(200 * time.Millisecond)
+	bbr.OnAckEventStart(ack2, 2400)
+	bbr.OnPacketAcked(3, 1200, 2400, ack2)
+	bbr.OnPacketAcked(4, 1200, 1200, ack2)
+	require.Equal(t, 91*time.Millisecond, bbr.pendingSendElapsed,
+		"send_elapsed for later packets should use the refreshed firstSentTime")
+}
+
 func TestBBRv3DrainCompletionAndProbeBWTransitions(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -215,6 +256,49 @@ func TestBBRv3AckAggregationRaisesCwndTarget(t *testing.T) {
 	withExtraAcked := bbr.congestionWindow
 
 	require.Greater(t, withExtraAcked, withoutExtraAcked)
+}
+
+func TestBBRv3RFCGains(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	bbr.state = BBRDrain
+	bbr.updateGains()
+	require.InDelta(t, 0.5, bbr.pacingGain, 0.0001)
+
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWDown
+	bbr.updateGains()
+	require.InDelta(t, 0.9, bbr.pacingGain, 0.0001)
+}
+
+func TestBBRv3ProbeRTTCwndUsesBoundedBandwidth(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.bwHi[0] = 10_000_000
+	bbr.bwLo = 2_000_000
+
+	expected := max(bbr.inflightFromBWGain(bbr.boundedBandwidth(), PROBE_RTT_CWND_GAIN), bbr.minPipeCwnd)
+	require.Equal(t, expected, bbr.probeRTTCwnd())
+}
+
+func TestBBRv3CwndLimitedSticksAcrossRoundBoundary(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+	bbr.congestionWindow = 10 * bbr.maxDatagramSize
+
+	// Mark the just-completed round as cwnd-limited from the send path.
+	bbr.OnPacketSent(now, 10*bbr.maxDatagramSize, 1, bbr.maxDatagramSize, true)
+	require.True(t, bbr.cwndLimitedInRound)
+
+	// Crossing a round boundary should preserve the signal for ACK-time decisions
+	// even when the instantaneous inflight on the boundary ACK is low.
+	bbr.nextRoundDelivered = 0
+	bbr.updateRoundStart(bbrRateSample{priorDelivered: 0})
+
+	require.True(t, bbr.cwndLimitedPrevRound)
+	require.False(t, bbr.cwndLimitedInRound)
+	require.True(t, bbr.isRoundCwndLimited(0),
+		"cwnd-limited state should remain visible for the just-completed round")
 }
 
 func TestBBRv3OnAckEventEndFlushesPendingAckEvent(t *testing.T) {
@@ -563,6 +647,29 @@ func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
 		"fullBandwidthReached should remain true after ProbeRTT")
 }
 
+func TestBBRv3GuardrailProbeRTTExitDoesNotRotateMaxBwFilter(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	bbr.state = BBRProbeRTT
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000
+	bbr.bwHi[1] = 50_000
+
+	bbr.exitProbeRTT(now)
+
+	require.Equal(t, BBRProbeBW, bbr.state)
+	require.Equal(t, probeBWCruise, bbr.probeBWPhase)
+	require.Equal(t, ackPhaseInit, bbr.ackPhase)
+	require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth())
+
+	bbr.roundStart = true
+	bbr.adaptUpperBounds(bbrRateSample{isAppLimited: false}, now.Add(time.Millisecond))
+
+	require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth(),
+		"the first post-ProbeRTT low sample must not rotate away the prior cycle's max_bw")
+}
+
 // TestBBRv3GuardrailProbeRTTRefreshesAppLimitedBubble verifies the ProbeRTT
 // RFC requirement to mark the connection app-limited on every ACK while
 // handling ProbeRTT, not just once on entry.
@@ -781,24 +888,24 @@ func TestBBRv3GuardrailExtraAckedWindowInStartup(t *testing.T) {
 	// After rotation, the slot was cleared to 0, then updated with new sample
 	// The important thing is that the OLD values (10_000, 5_000) were rotated out
 
-	// Verify that in non-Startup state, it takes 5 RTTs to rotate
+	// Verify that in non-Startup state, it takes 10 RTTs to rotate
 	bbr.state = BBRProbeBW
 	bbr.fullBandwidthReached = true
 	rotatedIdx := bbr.extraAckedWinIdx
 
-	// Simulate 4 more rounds (should NOT rotate with 5-RTT window)
-	for i := 0; i < 4; i++ {
+	// Simulate 9 more rounds (should NOT rotate with 10-RTT window)
+	for i := 0; i < 9; i++ {
 		bbr.roundStart = true
 		bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
 	}
 	require.Equal(t, rotatedIdx, bbr.extraAckedWinIdx,
-		"window should not rotate before 5 RTTs in ProbeBW")
+		"window should not rotate before 10 RTTs in ProbeBW")
 
-	// One more round (5th) should trigger rotation
+	// One more round (10th) should trigger rotation
 	bbr.roundStart = true
 	bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
 	require.NotEqual(t, rotatedIdx, bbr.extraAckedWinIdx,
-		"window should rotate after 5 RTTs in ProbeBW")
+		"window should rotate after 10 RTTs in ProbeBW")
 }
 
 // TestBBRv3GuardrailZeroInflightFromAckEventStart verifies P1 fix:

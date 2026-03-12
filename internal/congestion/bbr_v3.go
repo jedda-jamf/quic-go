@@ -12,19 +12,15 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
-// TODO(bbr): App-limited detection for ACK/timer-triggered send resumption.
-// The core app-limited "bubble" semantics are implemented, but RFC
-// draft-ietf-ccwg-bbr-05 §4.1.1.3 also calls for checking for app-limited
-// send opportunities on ACK/timer-driven send resumption paths.
-
 // BBRv3 Constants
 //
 // These constants are aligned with:
 // - RFC draft-ietf-ccwg-bbr-05 (IETF BBR specification)
 // - Google tcp_bbr.c v3 (Linux kernel reference implementation)
 //
-// Where values differ between RFC and tcp_bbr.c, we follow tcp_bbr.c for
-// proven real-world performance while noting the RFC value in comments.
+// Where the RFC and tcp_bbr.c differ, this implementation follows the RFC text.
+// The Linux implementation is used as an implementation reference where it does
+// not conflict with the RFC.
 const (
 	// ==========================================================================
 	// PACING AND CWND GAINS
@@ -40,26 +36,23 @@ const (
 	// See also: tcp_bbr.c:bbr_startup_cwnd_gain = BBR_UNIT * 2
 	STARTUP_CWND_GAIN = 2.0
 
-	// DRAIN_PACING_GAIN = 1/2.885 ≈ 0.347 per tcp_bbr.c
-	// RFC recommends ≤0.5 (§2.4). tcp_bbr.c uses 1/2.885 for symmetry with startup.
-	// This drains the queue created during startup in approximately one RTT.
-	// See also: tcp_bbr.c:bbr_drain_gain = BBR_UNIT * 1000 / 2885
-	DRAIN_PACING_GAIN = 1.0 / 2.885
+	// DRAIN_PACING_GAIN = 0.5 per RFC draft-ietf-ccwg-bbr-05 §5.3.2.
+	// This is the RFC-specified drain gain for reducing queue occupancy after Startup.
+	DRAIN_PACING_GAIN = 0.5
 
 	// CWND_GAIN_DEFAULT = 2 per RFC draft-ietf-ccwg-bbr-05 §2.5
 	// Default cwnd gain used in ProbeBW steady state.
 	// See also: tcp_bbr.c:bbr_cwnd_gain = BBR_UNIT * 2
 	CWND_GAIN_DEFAULT = 2.0
 
-	// PROBE_BW_UP_GAIN = 1.25 per tcp_bbr.c
+	// PROBE_BW_UP_GAIN = 1.25 per RFC draft-ietf-ccwg-bbr-05 §5.3.3.4.4
 	// Used during ProbeBW UP phase to probe for additional bandwidth.
 	// See also: tcp_bbr.c:bbr_pacing_gain[] = {BBR_UNIT * 5 / 4, ...}
 	PROBE_BW_UP_GAIN = 1.25
 
-	// PROBE_BW_DOWN_GAIN = 0.91 per tcp_bbr.c
+	// PROBE_BW_DOWN_GAIN = 0.90 per RFC draft-ietf-ccwg-bbr-05 §5.3.3.4.2.
 	// Used during ProbeBW DOWN phase to drain any excess queue.
-	// See also: tcp_bbr.c:bbr_pacing_gain[] = {..., BBR_UNIT * 91 / 100}
-	PROBE_BW_DOWN_GAIN = 0.91
+	PROBE_BW_DOWN_GAIN = 0.90
 
 	// PROBE_BW_BASE_GAIN = 1.0
 	// Used during ProbeBW CRUISE and REFILL phases.
@@ -177,10 +170,9 @@ const (
 	// See also: tcp_bbr.c pacing calculations
 	BBR_PACING_MARGIN = 0.99
 
-	// EXTRA_ACKED_WIN_RTS = 5 per tcp_bbr.c
-	// Note: RFC §2.11 suggests 10, but tcp_bbr.c uses 5 for conservative tracking.
-	// See also: tcp_bbr.c:bbr_extra_acked_win_rtts = 5
-	EXTRA_ACKED_WIN_RTS = 5
+	// EXTRA_ACKED_WIN_RTS = 10 per RFC draft-ietf-ccwg-bbr-05 §5.5.9.
+	// The Startup-specific 1-RTT window is handled separately below.
+	EXTRA_ACKED_WIN_RTS = 10
 
 	// EXTRA_ACKED_MAX_US = 100ms per tcp_bbr.c
 	// Max extra_acked contribution in time units.
@@ -202,9 +194,8 @@ const (
 	// See also: tcp_bbr.c BBR_DRAIN_N_RTTS concept
 	DRAIN_MAX_ROUNDS = 3
 
-	// EXTRA_ACKED_WIN_RTS_STARTUP = 1 per tcp_bbr.c
-	// Shorter extra_acked window in Startup for faster aggregation response.
-	// See also: tcp_bbr.c conditional window logic in bbr_update_ack_aggregation
+	// EXTRA_ACKED_WIN_RTS_STARTUP = 1 per RFC draft-ietf-ccwg-bbr-05 §5.5.9.
+	// In Startup, remember only one packet-timed round trip of aggregation.
 	EXTRA_ACKED_WIN_RTS_STARTUP = 1
 
 	// MAX_BW_FILTER_SLOTS = 2 per RFC draft-ietf-ccwg-bbr-05 §2.10
@@ -373,10 +364,12 @@ type BBRv3 struct {
 	inflightLo     protocol.ByteCount
 	inflightLatest protocol.ByteCount
 
-	roundCount         uint64
-	roundsSinceProbe   uint64
-	nextRoundDelivered uint64
-	roundStart         bool
+	roundCount           uint64
+	roundsSinceProbe     uint64
+	nextRoundDelivered   uint64
+	roundStart           bool
+	cwndLimitedInRound   bool
+	cwndLimitedPrevRound bool
 
 	lossRoundDelivered      uint64
 	lossRoundStart          bool
@@ -413,6 +406,7 @@ type BBRv3 struct {
 
 	priorCwnd   protocol.ByteCount
 	idleRestart bool
+	ptoRecovery bool
 
 	cycleStamp        monotime.Time
 	phaseStartStamp   monotime.Time
@@ -489,7 +483,13 @@ var (
 	_ SendAlgorithm               = &BBRv3{}
 	_ SendAlgorithmWithRTTStats   = &BBRv3{}
 	_ SendAlgorithmWithDebugInfos = &BBRv3{}
+	_ AckEventHandler             = &BBRv3{}
+	_ LossDetectionHandler        = &BBRv3{}
+	_ ECNFeedbackHandler          = &BBRv3{}
+	_ AppLimitedHandler           = &BBRv3{}
 	_ SpuriousLossHandler         = &BBRv3{}
+	_ PTOHandler                  = &BBRv3{}
+	_ ConnectionMigrationHandler  = &BBRv3{}
 )
 
 // NewBBRV3 creates a new BBRv3 congestion controller.
@@ -505,35 +505,49 @@ func NewBBRV3(
 	if l, ok := logger.(qlogwriter.Recorder); ok {
 		qlogger = l
 	}
-
-	now := monotime.Now()
 	bbr := &BBRv3{
-		rttStats:         rttStats,
-		maxDatagramSize:  initialMaxDatagramSize,
-		congestionWindow: initialMaxDatagramSize * initialCongestionWindow,
-		minPipeCwnd:      4 * initialMaxDatagramSize, // MIN_PIPE_CWND = 4*SMSS per RFC §2.7
-		initialCwnd:      initialMaxDatagramSize * initialCongestionWindow,
-		sendQuantum:      2 * initialMaxDatagramSize,
-		state:            BBRStartup,
-		probeBWPhase:     probeBWDown,
-		ackPhase:         ackPhaseInit,
-		pacingGain:       STARTUP_PACING_GAIN,
-		cwndGain:         STARTUP_CWND_GAIN,
-		bwLo:             protocol.MaxByteCount,
-		inflightHi:       protocol.MaxByteCount,
-		inflightLo:       protocol.MaxByteCount,
-		ecnAlpha:         1.0,
-		sentPackets:      make(map[protocol.PacketNumber]bbrSentPacketState),
-		rng:              rand.New(rand.NewSource(time.Now().UnixNano())),
-		qlogger:          qlogger,
-		lastState:        BBRStartup,
-		lastPhase:        probeBWDown,
-		ackEpochStart:    now,
-		// Initialize undo state to "no saved state"
-		undoBwLo:       protocol.MaxByteCount,
-		undoInflightLo: protocol.MaxByteCount,
-		undoInflightHi: protocol.MaxByteCount,
+		rttStats: rttStats,
+		qlogger:  qlogger,
 	}
+	bbr.resetControllerState(initialMaxDatagramSize, monotime.Now())
+	return bbr
+}
+
+func (bbr *BBRv3) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
+	bbr.resetControllerState(initialMaxDatagramSize, monotime.Now())
+}
+
+func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount, now monotime.Time) {
+	rttStats := bbr.rttStats
+	qlogger := bbr.qlogger
+
+	*bbr = BBRv3{}
+	bbr.rttStats = rttStats
+	bbr.qlogger = qlogger
+
+	bbr.maxDatagramSize = initialMaxDatagramSize
+	bbr.congestionWindow = initialMaxDatagramSize * initialCongestionWindow
+	bbr.minPipeCwnd = 4 * initialMaxDatagramSize
+	bbr.initialCwnd = initialMaxDatagramSize * initialCongestionWindow
+	bbr.sendQuantum = 2 * initialMaxDatagramSize
+	bbr.offloadBudget = bbr.sendQuantum
+	bbr.state = BBRStartup
+	bbr.probeBWPhase = probeBWDown
+	bbr.ackPhase = ackPhaseInit
+	bbr.pacingGain = STARTUP_PACING_GAIN
+	bbr.cwndGain = STARTUP_CWND_GAIN
+	bbr.bwLo = protocol.MaxByteCount
+	bbr.inflightHi = protocol.MaxByteCount
+	bbr.inflightLo = protocol.MaxByteCount
+	bbr.ecnAlpha = 1.0
+	bbr.sentPackets = make(map[protocol.PacketNumber]bbrSentPacketState)
+	bbr.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	bbr.lastState = BBRStartup
+	bbr.lastPhase = probeBWDown
+	bbr.ackEpochStart = now
+	bbr.undoBwLo = protocol.MaxByteCount
+	bbr.undoInflightLo = protocol.MaxByteCount
+	bbr.undoInflightHi = protocol.MaxByteCount
 	if bbr.congestionWindow < bbr.minPipeCwnd {
 		bbr.congestionWindow = bbr.minPipeCwnd
 	}
@@ -541,9 +555,6 @@ func NewBBRV3(
 	// Note: We intentionally do NOT initialize minRTT from rttStats.MinRTT() here.
 	// The RTT stats may have a default value (e.g., 100ms) that isn't a real measurement.
 	// BBR's minRTT should only be set from actual RTT samples in updateMinRTT().
-	// Using a default value would cause the min_rtt guard (Issue 3) to reject valid
-	// early samples that have short intervals.
-
 	bbr.pacer = newPacer(bbr.BandwidthEstimate)
 	bbr.initPacingRate()
 
@@ -555,7 +566,6 @@ func NewBBRV3(
 			RoundCount: bbr.roundCount,
 		})
 	}
-	return bbr
 }
 
 // Name returns the name of this congestion controller.
@@ -602,6 +612,9 @@ func (bbr *BBRv3) OnPacketSent(
 		} else if bbr.state == BBRProbeRTT {
 			bbr.checkProbeRTTDone(sentTime)
 		}
+	}
+	if bbr.isCwndLimitedInstantaneous(priorInFlight) {
+		bbr.cwndLimitedInRound = true
 	}
 
 	// App-limited detection per RFC §4.1.1.3: use bubble semantics, not cwnd utilization.
@@ -741,10 +754,22 @@ func (bbr *BBRv3) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	if !packetsRetransmitted {
 		return
 	}
-	bbr.saveCwnd()
-	if bbr.minPipeCwnd > 0 {
-		bbr.congestionWindow = bbr.minPipeCwnd
+	bbr.enterTimeoutRecovery(0)
+}
+
+func (bbr *BBRv3) OnPTO(bytesInFlight protocol.ByteCount) {
+	bbr.enterTimeoutRecovery(bytesInFlight)
+}
+
+func (bbr *BBRv3) enterTimeoutRecovery(bytesInFlight protocol.ByteCount) {
+	if !bbr.ptoRecovery {
+		bbr.saveCwnd()
+		bbr.saveStateUponLoss()
+		bbr.ptoRecovery = true
+	} else {
+		bbr.priorCwnd = max(bbr.priorCwnd, bbr.congestionWindow)
 	}
+	bbr.congestionWindow = max(bytesInFlight+bbr.maxDatagramSize, bbr.maxDatagramSize)
 }
 
 // SetMaxDatagramSize updates the max datagram size.
@@ -876,23 +901,7 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 		return
 	}
 
-	// Use post-loss bytesInFlight from OnAckEventStart when available.
-	// This provides accurate inflight for phase transitions when loss and ACKs
-	// arrive in the same event. Falls back to reconstruction if not set.
-	// Note: We check ackEventTime.IsZero() rather than ackEventBytesInFlight == 0
-	// because zero is a valid captured state (all in-flight data was lost).
-	var bytesInFlight protocol.ByteCount
-	if !bbr.ackEventTime.IsZero() {
-		bytesInFlight = bbr.ackEventBytesInFlight
-	} else {
-		bytesInFlight = bbr.bytesInFlightAfterACK()
-	}
-	// Account for bytes ACKed in this event
-	if bytesInFlight >= bbr.pendingAckedBytes {
-		bytesInFlight -= bbr.pendingAckedBytes
-	} else {
-		bytesInFlight = 0
-	}
+	bytesInFlight := bbr.bytesInFlightForAckEvent()
 
 	rs := bbrRateSample{
 		newlyAcked:     bbr.pendingAckedBytes,
@@ -911,11 +920,9 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 	if rs.interval > 0 && rs.delivered > 0 {
 		rs.deliveryRate = protocol.ByteCount(uint64(rs.delivered) * uint64(time.Second) / uint64(rs.interval))
 	}
-	// Issue 3 (P1 fix): Per RFC §4.1.2.3 (GenerateRateSample), suppress delivery_rate
-	// entirely when interval < min_rtt. Such samples are unreliable due to ACK
-	// aggregation/compression and must not influence ANY model state (bwLatest,
-	// checkFullBwReached, ProbeBW_UP bookkeeping, etc.), not just the max-bw filter.
-	// Guard is skipped when minRTT == 0 (not yet measured) to allow initial samples.
+	// Per RFC §4.1.2.3, suppress delivery_rate when interval < min_rtt.
+	// The ACK still carries valid delivered-volume and round-boundary signals;
+	// only the rate sample itself is unreliable.
 	if bbr.minRTT > 0 && rs.interval < bbr.minRTT {
 		rs.deliveryRate = 0
 	}
@@ -945,6 +952,15 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 
 	if rs.delivered > 0 {
 		bbr.idleRestart = false
+		bbr.ptoRecovery = false
+	}
+	// RFC §4.1.2.3 UpdateRateSample(): after processing the newest packet in the
+	// ACK event, C.first_send_time becomes that packet's send_time. Future packets
+	// sent while data remains in flight must inherit this updated origin so that
+	// send_elapsed measures from the latest delivery-curve knee, not from an
+	// increasingly stale connection-start timestamp.
+	if !bbr.pendingNewestSentTime.IsZero() {
+		bbr.firstSentTime = bbr.pendingNewestSentTime
 	}
 	bbr.maybeQlogStateChange()
 	bbr.maybeQlogRoundUpdate()
@@ -985,6 +1001,16 @@ func (bbr *BBRv3) bytesInFlightAfterACK() protocol.ByteCount {
 	return bbr.pendingPriorInFlight - bbr.pendingAckedBytes
 }
 
+func (bbr *BBRv3) bytesInFlightForAckEvent() protocol.ByteCount {
+	if !bbr.ackEventTime.IsZero() {
+		if bbr.ackEventBytesInFlight <= bbr.pendingAckedBytes {
+			return 0
+		}
+		return bbr.ackEventBytesInFlight - bbr.pendingAckedBytes
+	}
+	return bbr.bytesInFlightAfterACK()
+}
+
 // updateRoundStart checks for round boundary crossing per RFC §5.2.
 func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 	bbr.roundStart = false
@@ -992,6 +1018,8 @@ func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 		return
 	}
 	bbr.roundStart = true
+	bbr.cwndLimitedPrevRound = bbr.cwndLimitedInRound
+	bbr.cwndLimitedInRound = false
 	bbr.roundCount++
 	if bbr.roundsSinceProbe < math.MaxUint64 {
 		bbr.roundsSinceProbe++
@@ -1051,10 +1079,12 @@ func (bbr *BBRv3) updateECNAlpha(rs bbrRateSample) {
 
 func (bbr *BBRv3) updateLatestDeliverySignals(rs bbrRateSample) {
 	bbr.lossRoundStart = false
-	if rs.deliveryRate <= 0 || rs.newlyAcked <= 0 {
+	if rs.newlyAcked <= 0 {
 		return
 	}
-	bbr.bwLatest = max(bbr.bwLatest, rs.deliveryRate)
+	if rs.deliveryRate > 0 {
+		bbr.bwLatest = max(bbr.bwLatest, rs.deliveryRate)
+	}
 	bbr.inflightLatest = max(bbr.inflightLatest, rs.delivered)
 	if rs.priorDelivered >= bbr.lossRoundDelivered {
 		bbr.lossRoundDelivered = bbr.totalBytesAcked
@@ -1272,7 +1302,7 @@ func (bbr *BBRv3) updateCyclePhase(rs bbrRateSample, now monotime.Time) {
 			bbr.startProbeBWDown(now)
 			return
 		}
-		if bbr.isCwndLimited(rs.priorInFlight) && bbr.congestionWindow >= bbr.inflightHi {
+		if bbr.isRoundCwndLimited(rs.priorInFlight) && bbr.congestionWindow >= bbr.inflightHi {
 			bbr.resetFullBw()
 			// Guard: only seed fullBandwidth from valid samples (not suppressed by min_rtt)
 			if rs.deliveryRate > 0 {
@@ -1348,7 +1378,7 @@ func (bbr *BBRv3) handleInflightTooHigh(rs bbrRateSample) {
 }
 
 func (bbr *BBRv3) probeInflightHiUpward(rs bbrRateSample) {
-	if !bbr.isCwndLimited(rs.priorInFlight) || bbr.congestionWindow < bbr.inflightHi {
+	if !bbr.isRoundCwndLimited(rs.priorInFlight) || bbr.congestionWindow < bbr.inflightHi {
 		return
 	}
 	// Convert bytes to packets (round up to avoid under-counting)
@@ -1427,6 +1457,22 @@ func (bbr *BBRv3) startProbeBWCruise(now monotime.Time) {
 	bbr.phaseStartStamp = now
 }
 
+// startProbeBWCruiseAfterProbeRTT re-enters ProbeBW from ProbeRTT without
+// arming ACKS_PROBE_STOPPING. ProbeRTT is not the end of a bandwidth-probe
+// cycle, so the first low post-ProbeRTT samples must not rotate the max_bw
+// filter and discard the previous cycle's high samples.
+func (bbr *BBRv3) startProbeBWCruiseAfterProbeRTT(now monotime.Time) {
+	bbr.resetCongestionSignals()
+	bbr.bwProbeUpCnt = protocol.MaxByteCount
+	bbr.pickProbeWait()
+	bbr.cycleStamp = now
+	bbr.phaseStartStamp = now
+	bbr.ackPhase = ackPhaseInit
+	bbr.nextRoundDelivered = bbr.totalBytesAcked
+	bbr.roundStart = false
+	bbr.startProbeBWCruise(now)
+}
+
 func (bbr *BBRv3) startProbeBWRefill(now monotime.Time, probeUpRounds uint8) {
 	bbr.resetLowerBounds()
 	bbr.bwProbeUpRounds = probeUpRounds
@@ -1494,12 +1540,13 @@ func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
 	}
 
 	if bbr.state == BBRProbeRTT {
+		bytesInFlight := bbr.bytesInFlightForAckEvent()
 		// RFC §5.3.4.3 / tcp_bbr.c:bbr_update_min_rtt() refreshes the
 		// app-limited bubble on every ACK during ProbeRTT so the low-rate
 		// drain/refill samples do not poison max_bw.
-		bbr.MarkAppLimited(bbr.bytesInFlightAfterACK())
+		bbr.MarkAppLimited(bytesInFlight)
 		probeRTTCwnd := bbr.probeRTTCwnd()
-		if bbr.probeRTTDoneStamp.IsZero() && bbr.bytesInFlightAfterACK() <= probeRTTCwnd {
+		if bbr.probeRTTDoneStamp.IsZero() && bytesInFlight <= probeRTTCwnd {
 			bbr.probeRTTDoneStamp = now.Add(PROBE_RTT_DURATION)
 			bbr.probeRTTRoundDone = false
 			bbr.startRoundNow()
@@ -1527,8 +1574,7 @@ func (bbr *BBRv3) exitProbeRTT(now monotime.Time) {
 	bbr.resetLowerBounds()
 	if bbr.fullBandwidthReached {
 		bbr.state = BBRProbeBW
-		bbr.startProbeBWDown(now)
-		bbr.startProbeBWCruise(now)
+		bbr.startProbeBWCruiseAfterProbeRTT(now)
 		return
 	}
 	bbr.state = BBRStartup
@@ -1776,7 +1822,7 @@ func (bbr *BBRv3) targetCwnd(gain float64) protocol.ByteCount {
 }
 
 func (bbr *BBRv3) probeRTTCwnd() protocol.ByteCount {
-	return max(bbr.inflightFromBWGain(bbr.maxBandwidth(), PROBE_RTT_CWND_GAIN), bbr.minPipeCwnd)
+	return max(bbr.inflightFromBWGain(bbr.boundedBandwidth(), PROBE_RTT_CWND_GAIN), bbr.minPipeCwnd)
 }
 
 func (bbr *BBRv3) inflightFromBWGain(bw protocol.ByteCount, gain float64) protocol.ByteCount {
@@ -1818,8 +1864,8 @@ func (bbr *BBRv3) updateAckAggregation(rs bbrRateSample, now monotime.Time) {
 	}
 	if bbr.roundStart {
 		bbr.extraAckedWinRTTs = min(bbr.extraAckedWinRTTs+1, uint8(31))
-		// Issue 8: Use shorter extra_acked window (1 RTT) in Startup for faster
-		// aggregation response. Per tcp_bbr.c, Startup needs quicker adaptation.
+		// RFC §5.5.9 uses a 1-RTT aggregation window in Startup and the full
+		// BBRExtraAckedFilterLen window after full_bw_reached.
 		winThresh := uint8(EXTRA_ACKED_WIN_RTS)
 		if bbr.state == BBRStartup {
 			winThresh = EXTRA_ACKED_WIN_RTS_STARTUP
@@ -1910,7 +1956,11 @@ func (bbr *BBRv3) initPacingRate() {
 	bbr.pacingRate = protocol.ByteCount(float64(nominal) * STARTUP_PACING_GAIN)
 }
 
-func (bbr *BBRv3) isCwndLimited(bytesInFlight protocol.ByteCount) bool {
+func (bbr *BBRv3) isRoundCwndLimited(bytesInFlight protocol.ByteCount) bool {
+	return bbr.cwndLimitedPrevRound || bbr.cwndLimitedInRound || bbr.isCwndLimitedInstantaneous(bytesInFlight)
+}
+
+func (bbr *BBRv3) isCwndLimitedInstantaneous(bytesInFlight protocol.ByteCount) bool {
 	if bytesInFlight >= bbr.congestionWindow {
 		return true
 	}

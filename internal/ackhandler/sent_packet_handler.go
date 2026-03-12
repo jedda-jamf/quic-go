@@ -136,12 +136,12 @@ func NewSentPacketHandler(
 	cc := customCC
 	usesDefault := false
 	if cc == nil {
-		cc = congestion.NewCubicSender(
+		cc = congestion.NewBBRV3(
 			congestion.DefaultClock{},
 			rttStats,
 			connStats,
 			initialMaxDatagramSize,
-			true, // use Reno
+			true, // BBRv3 is pacing-based
 			qlogger,
 		)
 		usesDefault = true
@@ -1203,12 +1203,12 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 			return
 		}
 	}
-	h.congestion = congestion.NewCubicSender(
+	h.congestion = congestion.NewBBRV3(
 		congestion.DefaultClock{},
 		h.rttStats,
 		h.connStats,
 		initialMaxDatagramSize,
-		true, // use Reno
+		true, // BBRv3 is pacing-based
 		h.qlogger,
 	)
 	h.setLossDetectionTimer(now)
