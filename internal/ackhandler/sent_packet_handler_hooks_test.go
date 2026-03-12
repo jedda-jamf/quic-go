@@ -25,9 +25,11 @@ type hookTrackingCongestion struct {
 	ecnCE                 []int64
 	ecnPriorInFlight      []protocol.ByteCount
 	ptoBytesInFlight      []protocol.ByteCount
-	spuriousLosses        []int
+	spuriousPackets       []protocol.PacketNumber
+	spuriousReordering    []protocol.PacketNumber
 	migrationSizes        []protocol.ByteCount
 	appLimitedBytes       []protocol.ByteCount
+	packetThreshold       protocol.PacketNumber
 }
 
 func (*hookTrackingCongestion) TimeUntilSend(protocol.ByteCount) monotime.Time { return 0 }
@@ -73,8 +75,9 @@ func (h *hookTrackingCongestion) OnECNFeedback(
 func (h *hookTrackingCongestion) MarkAppLimited(bytesInFlight protocol.ByteCount) {
 	h.appLimitedBytes = append(h.appLimitedBytes, bytesInFlight)
 }
-func (h *hookTrackingCongestion) OnSpuriousLossDetected(spuriousCount int) {
-	h.spuriousLosses = append(h.spuriousLosses, spuriousCount)
+func (h *hookTrackingCongestion) OnSpuriousLossDetected(packetNumber, packetReordering protocol.PacketNumber) {
+	h.spuriousPackets = append(h.spuriousPackets, packetNumber)
+	h.spuriousReordering = append(h.spuriousReordering, packetReordering)
 }
 func (h *hookTrackingCongestion) OnPTO(bytesInFlight protocol.ByteCount) {
 	h.ptoBytesInFlight = append(h.ptoBytesInFlight, bytesInFlight)
@@ -82,6 +85,12 @@ func (h *hookTrackingCongestion) OnPTO(bytesInFlight protocol.ByteCount) {
 func (h *hookTrackingCongestion) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
 	h.migrationSizes = append(h.migrationSizes, initialMaxDatagramSize)
 	h.maxDatagramSize = initialMaxDatagramSize
+}
+func (h *hookTrackingCongestion) GetPacketReorderThreshold() protocol.PacketNumber {
+	if h.packetThreshold == 0 {
+		return 3
+	}
+	return h.packetThreshold
 }
 
 type fallbackOnlyCongestion struct {
@@ -242,6 +251,51 @@ func TestSentPacketHandlerNotifiesPTOHook(t *testing.T) {
 	require.Equal(t, []protocol.ByteCount{1200}, cong.ptoBytesInFlight)
 }
 
+func TestSentPacketHandlerUsesOptionalPacketReorderingHooks(t *testing.T) {
+	now := monotime.Now()
+	cong := &hookTrackingCongestion{packetThreshold: 5}
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		false,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		cong,
+		utils.DefaultLogger,
+	)
+
+	for i := range 7 {
+		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
+		sph.SentPacket(now.Add(time.Duration(i)*time.Millisecond), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1200, false, false)
+	}
+
+	acked, err := sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 5, Largest: 5}}},
+		protocol.Encryption1RTT,
+		now.Add(10*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.True(t, acked)
+	require.Empty(t, cong.spuriousPackets)
+
+	acked, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: []wire.AckRange{
+			{Smallest: 6, Largest: 6},
+			{Smallest: 0, Largest: 0},
+		}},
+		protocol.Encryption1RTT,
+		now.Add(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.True(t, acked)
+	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)
+	require.Equal(t, []protocol.PacketNumber{6}, cong.spuriousReordering)
+}
+
 func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
 	now := monotime.Now()
 	cong := &hookTrackingCongestion{}
@@ -281,5 +335,6 @@ func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
 		now.Add(10*time.Millisecond),
 	)
 
-	require.Equal(t, []int{1}, cong.spuriousLosses)
+	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)
+	require.Equal(t, []protocol.PacketNumber{4}, cong.spuriousReordering)
 }
