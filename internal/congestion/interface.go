@@ -66,7 +66,13 @@ type AppLimitedHandler interface {
 // SpuriousLossHandler is implemented by congestion controllers that can react
 // to packets that were spuriously declared lost.
 type SpuriousLossHandler interface {
-	OnSpuriousLossDetected(spuriousCount int)
+	OnSpuriousLossDetected(packetNumber protocol.PacketNumber, packetReordering protocol.PacketNumber)
+}
+
+// PacketReorderingThresholdProvider is implemented by congestion controllers
+// that want to override the default RFC 9002 packet reordering threshold.
+type PacketReorderingThresholdProvider interface {
+	GetPacketReorderThreshold() protocol.PacketNumber
 }
 
 // PTOHandler is implemented by congestion controllers that want an explicit

@@ -569,7 +569,10 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	}
 	if len(spuriousLosses) > 0 {
 		if slh, ok := h.congestion.(congestion.SpuriousLossHandler); ok {
-			slh.OnSpuriousLossDetected(len(spuriousLosses))
+			for _, pn := range spuriousLosses {
+				packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
+				slh.OnSpuriousLossDetected(pn, packetReordering)
+			}
 		}
 	}
 }
@@ -839,6 +842,10 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pnSpace.lossTime = 0
+	packetReorderThreshold := protocol.PacketNumber(packetThreshold)
+	if pth, ok := h.congestion.(congestion.PacketReorderingThresholdProvider); ok {
+		packetReorderThreshold = pth.GetPacketReorderThreshold()
+	}
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
 	lossDelay := time.Duration(timeThreshold * maxRTT)
@@ -872,7 +879,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetReorderThreshold {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {
