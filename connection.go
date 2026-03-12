@@ -687,6 +687,9 @@ runLoop:
 		// This could cause packets to be declared lost, and retransmissions to be enqueued.
 		now := monotime.Now()
 		if timeout := c.sentPacketHandler.GetLossDetectionTimeout(); !timeout.IsZero() && !timeout.After(now) {
+			if c.handshakeConfirmed {
+				c.maybeMarkAppLimitedOnResumption(now)
+			}
 			if err := c.sentPacketHandler.OnLossDetectionTimeout(now); err != nil {
 				c.setCloseError(&closeError{err: err})
 				break runLoop
@@ -2121,6 +2124,9 @@ func (c *Conn) handleHandshakeDoneFrame(rcvTime monotime.Time) error {
 }
 
 func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) error {
+	if encLevel == protocol.Encryption1RTT {
+		c.maybeMarkAppLimitedOnResumption(rcvTime)
+	}
 	acked1RTTPacket, err := c.sentPacketHandler.ReceivedAck(frame, encLevel, c.lastPacketReceivedTime)
 	if err != nil {
 		return err
@@ -2144,6 +2150,26 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
 		}
 	}
 	return c.cryptoStreamHandler.SetLargest1RTTAcked(frame.LargestAcked())
+}
+
+// maybeMarkAppLimitedOnResumption implements the transport-side app-limited
+// check for ACK- and timer-driven send resumption.
+func (c *Conn) maybeMarkAppLimitedOnResumption(now monotime.Time) {
+	switch c.sentPacketHandler.SendMode(now) {
+	case ackhandler.SendAny, ackhandler.SendPacingLimited:
+	default:
+		return
+	}
+	if c.framer.HasData() {
+		return
+	}
+	if c.datagramQueue != nil && c.datagramQueue.Peek() != nil {
+		return
+	}
+	if c.retransmissionQueue.HasData(protocol.Encryption1RTT) {
+		return
+	}
+	ackhandler.NotifyAppLimited(c.sentPacketHandler)
 }
 
 func (c *Conn) handleDatagramFrame(f *wire.DatagramFrame) error {
@@ -2572,6 +2598,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
+				ackhandler.NotifyAppLimited(c.sentPacketHandler)
 				return nil
 			}
 			return err
@@ -2615,6 +2642,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			}
 			if buf.Len() == 0 {
 				buf.Release()
+				ackhandler.NotifyAppLimited(c.sentPacketHandler)
 				return nil
 			}
 			dontSendMore = true
