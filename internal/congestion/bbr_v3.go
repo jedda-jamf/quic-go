@@ -1608,11 +1608,10 @@ func (bbr *BBRv3) saveStateUponLoss() {
 // Per RFC §5.5.11.2 (BBRHandleSpuriousLossDetection), we restore model bounds
 // to their pre-loss values to undo loss-driven reductions that were triggered
 // by reordering rather than actual congestion.
-func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
-	// Threshold check: only recover if enough spurious losses detected.
-	// spuriousLossRecoveryThreshold=0 means recover on any spurious loss (count >= 1).
-	// Higher values require that many spurious losses before triggering recovery.
-	if spuriousCount < spuriousLossRecoveryThreshold {
+func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.PacketNumber) {
+	// Threshold check: only recover if the branch is configured to react to
+	// per-packet spurious loss callbacks.
+	if 1 < spuriousLossRecoveryThreshold {
 		return
 	}
 
@@ -1671,7 +1670,7 @@ func (bbr *BBRv3) OnSpuriousLossDetected(spuriousCount int) {
 			inflightHiVal = uint64(bbr.inflightHi)
 		}
 		bbr.qlogger.RecordEvent(qlog.BBRv3SpuriousLossRecovery{
-			SpuriousCount:      spuriousCount,
+			SpuriousCount:      1,
 			RestoredBwLo:       bwLoVal,
 			RestoredInflightLo: inflightLoVal,
 			RestoredInflightHi: inflightHiVal,
