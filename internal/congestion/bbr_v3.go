@@ -381,8 +381,8 @@ type BBRv3 struct {
 	lossEventCountedThisACK bool // Ensures we count at most one loss event per ACK event
 	bytesLostInRound        protocol.ByteCount
 
-	// Drain state round counter for 3-round fallback exit per RFC §5.3.2.
-	drainRounds int
+	// Drain state baseline round_count for the RFC §5.3.2 fallback exit.
+	drainStartRound uint64
 
 	totalBytesSent    uint64
 	totalBytesAcked   uint64
@@ -1258,18 +1258,14 @@ func (bbr *BBRv3) resetFullBw() {
 func (bbr *BBRv3) checkDrain(rs bbrRateSample, now monotime.Time) {
 	if bbr.state == BBRStartup && bbr.fullBandwidthReached {
 		bbr.state = BBRDrain
-		bbr.drainRounds = 0 // Reset drain round counter on Drain entry per RFC §5.3.2.
+		bbr.drainStartRound = bbr.roundCount
 		bbr.resetCongestionSignals()
 	}
 	if bbr.state == BBRDrain {
-		// Track rounds in Drain for the 3-round fallback exit per RFC §5.3.2.
-		if bbr.roundStart {
-			bbr.drainRounds++
-		}
-		// Exit Drain when either:
-		// 1. Inflight drops to BDP (normal exit)
-		// 2. Drain has lasted DRAIN_MAX_ROUNDS (fallback to avoid getting stuck)
-		if rs.bytesInFlight <= bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0) || bbr.drainRounds >= DRAIN_MAX_ROUNDS {
+		// draft-ietf-ccwg-bbr-05 §5.3.2 exits Drain when inflight drops to BDP,
+		// or when round_count advances more than 3 rounds past drain_start_round.
+		if rs.bytesInFlight <= bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0) ||
+			bbr.roundCount > bbr.drainStartRound+DRAIN_MAX_ROUNDS {
 			bbr.state = BBRProbeBW
 			bbr.startProbeBWDown(now)
 		}

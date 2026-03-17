@@ -170,6 +170,37 @@ func TestBBRv3DrainCompletionAndProbeBWTransitions(t *testing.T) {
 	require.Equal(t, probeBWDown, bbr.probeBWPhase)
 }
 
+func TestBBRv3DrainFallbackUsesDrainStartRound(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	bbr.state = BBRStartup
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 100_000_000
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.roundCount = 7
+
+	highInflight := protocol.ByteCount(10_000_000)
+
+	bbr.roundStart = true
+	bbr.checkDrain(bbrRateSample{bytesInFlight: highInflight}, now)
+	require.Equal(t, BBRDrain, bbr.state)
+	require.Equal(t, uint64(7), bbr.drainStartRound)
+
+	for _, round := range []uint64{8, 9, 10} {
+		bbr.roundCount = round
+		bbr.roundStart = true
+		bbr.checkDrain(bbrRateSample{bytesInFlight: highInflight}, now)
+		require.Equal(t, BBRDrain, bbr.state,
+			"Drain must persist until round_count exceeds drain_start_round + 3")
+	}
+
+	bbr.roundCount = 11
+	bbr.roundStart = true
+	bbr.checkDrain(bbrRateSample{bytesInFlight: highInflight}, now)
+	require.Equal(t, BBRProbeBW, bbr.state)
+}
+
 func TestBBRv3ProbeTimingWallClockAndRenoRoundTrigger(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
