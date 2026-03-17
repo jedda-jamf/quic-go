@@ -45,6 +45,32 @@ func TestBBRv3StartupExitByFullBwPlateau(t *testing.T) {
 	require.Equal(t, BBRDrain, bbr.state)
 }
 
+func TestBBRv3CheckFullBwReachedIgnoresIntraRoundSamples(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRStartup
+	bbr.fullBandwidth = 1_000
+	bbr.bwHi[0] = 1_000
+	bbr.minRTT = 10 * time.Millisecond
+
+	plateau := bbrRateSample{deliveryRate: 1_100}
+	intraRoundSpike := bbrRateSample{deliveryRate: 1_300}
+
+	for round := 0; round < FULL_BW_ROUNDS; round++ {
+		bbr.roundStart = true
+		bbr.checkFullBwReached(plateau)
+		require.Equal(t, round+1, bbr.fullBandwidthCount)
+
+		bbr.roundStart = false
+		bbr.checkFullBwReached(intraRoundSpike)
+		require.Equal(t, round+1, bbr.fullBandwidthCount,
+			"non-round-start ACKs must not reset the full bandwidth detector")
+		require.Equal(t, protocol.ByteCount(1_000), bbr.fullBandwidth,
+			"non-round-start ACKs must not advance the full bandwidth baseline")
+	}
+
+	require.True(t, bbr.fullBandwidthReached)
+}
+
 func TestBBRv3StartupExitByExcessiveLoss(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.state = BBRStartup

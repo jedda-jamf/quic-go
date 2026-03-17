@@ -1222,18 +1222,23 @@ func (bbr *BBRv3) handleQueueTooHighInStartup() {
 	bbr.inflightHi = max(bdp, bbr.inflightLatest)
 }
 
-// checkFullBwReached implements full bandwidth detection per tcp_bbr.c bbr_check_full_bw_reached().
+// checkFullBwReached implements full bandwidth detection per
+// draft-ietf-ccwg-bbr-05 §5.3.1.2 BBRCheckFullBWReached().
+//
+// Per the draft, this function MUST only run on round_start boundaries.
+// The entire check (both the growth comparison and the count increment)
+// is gated on round_start to ensure that bandwidth growth is evaluated
+// once per round trip, not on every ACK. Without this gate, intra-round
+// delivery rate fluctuations can repeatedly reset the full_bw counter,
+// preventing Startup from ever detecting a bandwidth plateau.
 func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
-	if bbr.fullBandwidthNow || rs.isAppLimited || rs.deliveryRate == 0 {
+	if bbr.fullBandwidthNow || !bbr.roundStart || rs.isAppLimited || rs.deliveryRate == 0 {
 		return
 	}
 	thresh := protocol.ByteCount(float64(max(bbr.fullBandwidth, 1)) * FULL_BW_GROWTH_THRESHOLD)
 	if rs.deliveryRate >= thresh {
 		bbr.resetFullBw()
 		bbr.fullBandwidth = rs.deliveryRate
-		return
-	}
-	if !bbr.roundStart {
 		return
 	}
 	bbr.fullBandwidthCount++
