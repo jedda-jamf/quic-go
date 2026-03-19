@@ -1737,7 +1737,7 @@ func (bbr *BBRv3) updateGains() {
 		}
 	case BBRProbeRTT:
 		bbr.pacingGain = 1.0
-		bbr.cwndGain = 1.0
+		bbr.cwndGain = PROBE_RTT_CWND_GAIN
 	}
 }
 
