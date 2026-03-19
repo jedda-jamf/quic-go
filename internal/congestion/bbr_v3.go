@@ -565,6 +565,8 @@ func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount
 			Phase:      "",
 			RoundCount: bbr.roundCount,
 		})
+		bbr.qlogger.RecordEvent(bbr.qlogModelUpdate("init"))
+		bbr.qlogger.RecordEvent(bbr.qlogControlUpdate("init"))
 	}
 }
 
@@ -963,7 +965,7 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 		bbr.firstSentTime = bbr.pendingNewestSentTime
 	}
 	bbr.maybeQlogStateChange()
-	bbr.maybeQlogRoundUpdate()
+	bbr.maybeQlogRoundUpdate(rs)
 	bbr.clearPendingAckEvent()
 }
 
@@ -1998,63 +2000,105 @@ func (bbr *BBRv3) maybeQlogStateChange() {
 		bbr.qlogger.RecordEvent(qlog.CongestionStateUpdated{State: state})
 
 		// Emit BBRv3-specific state event
-		phase := ""
-		if bbr.state == BBRProbeBW {
-			phase = bbr.probeBWPhase.String()
-		}
+		phase := bbr.qlogPhase()
 		bbr.qlogger.RecordEvent(qlog.BBRv3StateUpdated{
 			State:      bbr.state.String(),
 			Phase:      phase,
 			RoundCount: bbr.roundCount,
 		})
 
-		// Emit model update on state change
-		var bwLoVal, bwHiVal, inflightLoVal, inflightHiVal uint64
-		if bbr.bwLo != protocol.MaxByteCount {
-			bwLoVal = uint64(bbr.bwLo)
-		}
-		if bbr.bwHi[0] > 0 || bbr.bwHi[1] > 0 {
-			bwHiVal = uint64(bbr.maxBandwidth())
-		}
-		if bbr.inflightLo != protocol.MaxByteCount {
-			inflightLoVal = uint64(bbr.inflightLo)
-		}
-		if bbr.inflightHi != protocol.MaxByteCount {
-			inflightHiVal = uint64(bbr.inflightHi)
-		}
-		bbr.qlogger.RecordEvent(qlog.BBRv3ModelUpdated{
-			MaxBW:         uint64(bbr.maxBandwidth()),
-			BwLo:          bwLoVal,
-			BwHi:          bwHiVal,
-			MinRTT:        bbr.minRTT,
-			InflightHi:    inflightHiVal,
-			InflightLo:    inflightLoVal,
-			BDP:           uint64(bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0)),
-			FullBWReached: bbr.fullBandwidthReached,
-		})
-
-		// Emit control update
-		bbr.qlogger.RecordEvent(qlog.BBRv3ControlUpdated{
-			PacingRate: uint64(bbr.pacingRate),
-			Cwnd:       uint64(bbr.congestionWindow),
-			PacingGain: bbr.pacingGain,
-			CwndGain:   bbr.cwndGain,
-		})
+		bbr.qlogger.RecordEvent(bbr.qlogModelUpdate("state_change"))
+		bbr.qlogger.RecordEvent(bbr.qlogControlUpdate("state_change"))
 	}
 }
 
 // maybeQlogRoundUpdate emits qlog events on round boundaries.
-func (bbr *BBRv3) maybeQlogRoundUpdate() {
+func (bbr *BBRv3) maybeQlogRoundUpdate(rs bbrRateSample) {
 	if bbr.qlogger == nil || !bbr.roundStart || bbr.roundCount == bbr.lastRoundCount {
 		return
 	}
 	bbr.lastRoundCount = bbr.roundCount
-	bbr.qlogger.RecordEvent(qlog.BBRv3RoundUpdated{
-		RoundCount:       bbr.roundCount,
-		LossInRound:      bbr.lossInRound,
-		ECNInRound:       bbr.ecnInRound,
-		BytesLostInRound: uint64(bbr.bytesLostInRound),
-	})
+	bbr.qlogger.RecordEvent(bbr.qlogRoundUpdate(rs))
+	if bbr.state == BBRStartup {
+		bbr.qlogger.RecordEvent(bbr.qlogModelUpdate("startup_round"))
+		bbr.qlogger.RecordEvent(bbr.qlogControlUpdate("startup_round"))
+	}
+}
+
+func (bbr *BBRv3) qlogPhase() string {
+	if bbr.state != BBRProbeBW {
+		return ""
+	}
+	return bbr.probeBWPhase.String()
+}
+
+func (bbr *BBRv3) qlogModelUpdate(trigger string) qlog.BBRv3ModelUpdated {
+	var bwLoVal, bwHiVal, inflightLoVal, inflightHiVal uint64
+	if bbr.bwLo != protocol.MaxByteCount {
+		bwLoVal = uint64(bbr.bwLo)
+	}
+	if bbr.bwHi[0] > 0 || bbr.bwHi[1] > 0 {
+		bwHiVal = uint64(bbr.maxBandwidth())
+	}
+	if bbr.inflightLo != protocol.MaxByteCount {
+		inflightLoVal = uint64(bbr.inflightLo)
+	}
+	if bbr.inflightHi != protocol.MaxByteCount {
+		inflightHiVal = uint64(bbr.inflightHi)
+	}
+	return qlog.BBRv3ModelUpdated{
+		Trigger:       trigger,
+		MaxBW:         uint64(bbr.maxBandwidth()),
+		BwLo:          bwLoVal,
+		BwHi:          bwHiVal,
+		MinRTT:        bbr.minRTT,
+		InflightHi:    inflightHiVal,
+		InflightLo:    inflightLoVal,
+		BDP:           uint64(bbr.inflightFromBWGain(bbr.maxBandwidth(), 1.0)),
+		FullBWReached: bbr.fullBandwidthReached,
+	}
+}
+
+func (bbr *BBRv3) qlogControlUpdate(trigger string) qlog.BBRv3ControlUpdated {
+	return qlog.BBRv3ControlUpdated{
+		Trigger:    trigger,
+		PacingRate: uint64(bbr.pacingRate),
+		Cwnd:       uint64(bbr.congestionWindow),
+		PacingGain: bbr.pacingGain,
+		CwndGain:   bbr.cwndGain,
+	}
+}
+
+func (bbr *BBRv3) qlogRoundUpdate(rs bbrRateSample) qlog.BBRv3RoundUpdated {
+	return qlog.BBRv3RoundUpdated{
+		State:              bbr.state.String(),
+		Phase:              bbr.qlogPhase(),
+		RoundCount:         bbr.roundCount,
+		RoundStart:         bbr.roundStart,
+		LossInRound:        bbr.lossInRound,
+		ECNInRound:         bbr.ecnInRound,
+		BytesLostInRound:   uint64(bbr.bytesLostInRound),
+		DeliveryRate:       uint64(rs.deliveryRate),
+		DeliveryRateValid:  bbr.isRateSampleValid(rs),
+		AppLimited:         rs.isAppLimited,
+		FullBW:             uint64(bbr.fullBandwidth),
+		FullBWCount:        uint64(bbr.fullBandwidthCount),
+		FullBWNow:          bbr.fullBandwidthNow,
+		FullBWReached:      bbr.fullBandwidthReached,
+		PacingRate:         uint64(bbr.pacingRate),
+		BytesInFlight:      uint64(rs.bytesInFlight),
+		Cwnd:               uint64(bbr.congestionWindow),
+		SendElapsed:        rs.sendElapsed,
+		AckElapsed:         rs.ackElapsed,
+		RateSampleInterval: rs.interval,
+	}
+}
+
+func (bbr *BBRv3) isRateSampleValid(rs bbrRateSample) bool {
+	if rs.delivered == 0 || rs.interval <= 0 {
+		return false
+	}
+	return bbr.minRTT == 0 || rs.interval >= bbr.minRTT
 }
 
 func maxDuration(a, b time.Duration) time.Duration {

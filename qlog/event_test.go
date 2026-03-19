@@ -923,3 +923,90 @@ func TestBBRv3SpuriousLossRecovery(t *testing.T) {
 	require.EqualValues(t, 120000, ev["restored_inflight_hi"])
 	require.EqualValues(t, 100000, ev["restored_cwnd"])
 }
+
+func TestBBRv3ModelUpdated(t *testing.T) {
+	name, ev := testEventEncoding(t, &BBRv3ModelUpdated{
+		Trigger:       "startup_round",
+		MaxBW:         1_250_000,
+		BwLo:          1_000_000,
+		BwHi:          1_300_000,
+		MinRTT:        150 * time.Millisecond,
+		InflightHi:    2_000_000,
+		InflightLo:    1_500_000,
+		BDP:           187_500,
+		FullBWReached: false,
+	})
+
+	require.Equal(t, "recovery:bbr_model_updated", name)
+	require.Equal(t, "startup_round", ev["trigger"])
+	require.EqualValues(t, 1_250_000, ev["max_bw"])
+	require.EqualValues(t, 1_000_000, ev["bw_lo"])
+	require.EqualValues(t, 1_300_000, ev["bw_hi"])
+	require.Equal(t, 150.0, ev["min_rtt"])
+	require.EqualValues(t, 2_000_000, ev["inflight_hi"])
+	require.EqualValues(t, 1_500_000, ev["inflight_lo"])
+	require.EqualValues(t, 187_500, ev["bdp"])
+	require.Equal(t, false, ev["full_bw_reached"])
+}
+
+func TestBBRv3ControlUpdated(t *testing.T) {
+	name, ev := testEventEncoding(t, &BBRv3ControlUpdated{
+		Trigger:    "init",
+		PacingRate: 1_750_000,
+		Cwnd:       256_000,
+		PacingGain: 2.77,
+		CwndGain:   2.0,
+	})
+
+	require.Equal(t, "recovery:bbr_control_updated", name)
+	require.Equal(t, "init", ev["trigger"])
+	require.EqualValues(t, 1_750_000, ev["pacing_rate"])
+	require.EqualValues(t, 256_000, ev["cwnd"])
+	require.Equal(t, 2.77, ev["pacing_gain"])
+	require.Equal(t, 2.0, ev["cwnd_gain"])
+}
+
+func TestBBRv3RoundUpdated(t *testing.T) {
+	name, ev := testEventEncoding(t, &BBRv3RoundUpdated{
+		State:              "startup",
+		RoundCount:         8,
+		RoundStart:         true,
+		LossInRound:        false,
+		ECNInRound:         true,
+		BytesLostInRound:   1200,
+		DeliveryRate:       1_100_000,
+		DeliveryRateValid:  true,
+		AppLimited:         false,
+		FullBW:             900_000,
+		FullBWCount:        2,
+		FullBWNow:          false,
+		FullBWReached:      false,
+		PacingRate:         2_400_000,
+		BytesInFlight:      1_600_000,
+		Cwnd:               2_200_000,
+		SendElapsed:        125 * time.Millisecond,
+		AckElapsed:         150 * time.Millisecond,
+		RateSampleInterval: 150 * time.Millisecond,
+	})
+
+	require.Equal(t, "recovery:bbr_round_updated", name)
+	require.Equal(t, "startup", ev["state"])
+	require.EqualValues(t, 8, ev["round_count"])
+	require.Equal(t, true, ev["round_start"])
+	require.Equal(t, false, ev["loss_in_round"])
+	require.Equal(t, true, ev["ecn_in_round"])
+	require.EqualValues(t, 1200, ev["bytes_lost_in_round"])
+	require.EqualValues(t, 1_100_000, ev["delivery_rate"])
+	require.Equal(t, true, ev["delivery_rate_valid"])
+	require.Equal(t, false, ev["app_limited"])
+	require.EqualValues(t, 900_000, ev["full_bw"])
+	require.EqualValues(t, 2, ev["full_bw_count"])
+	require.Equal(t, false, ev["full_bw_now"])
+	require.Equal(t, false, ev["full_bw_reached"])
+	require.EqualValues(t, 2_400_000, ev["pacing_rate"])
+	require.EqualValues(t, 1_600_000, ev["bytes_in_flight"])
+	require.EqualValues(t, 2_200_000, ev["cwnd"])
+	require.Equal(t, 125.0, ev["send_elapsed"])
+	require.Equal(t, 150.0, ev["ack_elapsed"])
+	require.Equal(t, 150.0, ev["rate_sample_interval"])
+}

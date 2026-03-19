@@ -8,12 +8,24 @@ import (
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/stretchr/testify/require"
 )
 
 func newTestBBRv3() *BBRv3 {
 	return NewBBRV3(DefaultClock{}, utils.NewRTTStats(), nil, initialMaxDatagramSize, false, nil)
 }
+
+type recordingQlogger struct {
+	events []qlogwriter.Event
+}
+
+func (r *recordingQlogger) RecordEvent(ev qlogwriter.Event) {
+	r.events = append(r.events, ev)
+}
+
+func (r *recordingQlogger) Close() error { return nil }
 
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
@@ -25,6 +37,68 @@ func TestBBRv3PacingBudget(t *testing.T) {
 	}
 	require.False(t, bbr.HasPacingBudget(now))
 	require.True(t, bbr.HasPacingBudget(now.Add(200*time.Millisecond)))
+}
+
+func TestBBRv3InitialQlogTelemetry(t *testing.T) {
+	rec := &recordingQlogger{}
+	_ = NewBBRV3(DefaultClock{}, utils.NewRTTStats(), nil, initialMaxDatagramSize, false, rec)
+
+	require.Len(t, rec.events, 4)
+	require.IsType(t, qlog.CongestionStateUpdated{}, rec.events[0])
+	require.IsType(t, qlog.BBRv3StateUpdated{}, rec.events[1])
+	require.IsType(t, qlog.BBRv3ModelUpdated{}, rec.events[2])
+	require.IsType(t, qlog.BBRv3ControlUpdated{}, rec.events[3])
+
+	model := rec.events[2].(qlog.BBRv3ModelUpdated)
+	control := rec.events[3].(qlog.BBRv3ControlUpdated)
+	require.Equal(t, "init", model.Trigger)
+	require.Equal(t, "init", control.Trigger)
+}
+
+func TestBBRv3StartupRoundQlogTelemetry(t *testing.T) {
+	bbr := newTestBBRv3()
+	rec := &recordingQlogger{}
+	bbr.qlogger = rec
+
+	bbr.state = BBRStartup
+	bbr.roundStart = true
+	bbr.roundCount = 7
+	bbr.lossInRound = true
+	bbr.bytesLostInRound = 1200
+	bbr.fullBandwidth = 900_000
+	bbr.fullBandwidthCount = 2
+	bbr.pacingRate = 2_400_000
+	bbr.congestionWindow = 2_200_000
+	bbr.minRTT = 150 * time.Millisecond
+
+	rs := bbrRateSample{
+		delivered:     120_000,
+		deliveryRate:  1_100_000,
+		bytesInFlight: 1_600_000,
+		sendElapsed:   125 * time.Millisecond,
+		ackElapsed:    150 * time.Millisecond,
+		interval:      150 * time.Millisecond,
+	}
+
+	bbr.maybeQlogRoundUpdate(rs)
+
+	require.Len(t, rec.events, 3)
+	require.IsType(t, qlog.BBRv3RoundUpdated{}, rec.events[0])
+	require.IsType(t, qlog.BBRv3ModelUpdated{}, rec.events[1])
+	require.IsType(t, qlog.BBRv3ControlUpdated{}, rec.events[2])
+
+	round := rec.events[0].(qlog.BBRv3RoundUpdated)
+	model := rec.events[1].(qlog.BBRv3ModelUpdated)
+	control := rec.events[2].(qlog.BBRv3ControlUpdated)
+
+	require.Equal(t, "startup", round.State)
+	require.True(t, round.RoundStart)
+	require.EqualValues(t, 1_100_000, round.DeliveryRate)
+	require.True(t, round.DeliveryRateValid)
+	require.EqualValues(t, 900_000, round.FullBW)
+	require.EqualValues(t, 2, round.FullBWCount)
+	require.Equal(t, "startup_round", model.Trigger)
+	require.Equal(t, "startup_round", control.Trigger)
 }
 
 func TestBBRv3StartupExitByFullBwPlateau(t *testing.T) {
