@@ -27,6 +27,40 @@ func (r *recordingQlogger) RecordEvent(ev qlogwriter.Event) {
 
 func (r *recordingQlogger) Close() error { return nil }
 
+// setupStartup configures BBR in Startup with reasonable defaults
+func setupStartup(bbr *BBRv3) {
+	bbr.state = BBRStartup
+	bbr.fullBandwidthReached = false
+	bbr.pacingGain = STARTUP_PACING_GAIN
+	bbr.cwndGain = STARTUP_CWND_GAIN
+}
+
+// setupDrain configures BBR in Drain after Startup exit
+func setupDrain(bbr *BBRv3) {
+	bbr.state = BBRDrain
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000
+	bbr.minRTT = 40 * time.Millisecond
+}
+
+// setupProbeBWPhase configures BBR in a specific ProbeBW phase
+func setupProbeBWPhase(bbr *BBRv3, phase bbrProbeBWPhase) {
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = phase
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.congestionWindow = 100_000
+}
+
+// setupProbeRTT configures BBR in ProbeRTT
+func setupProbeRTT(bbr *BBRv3) {
+	bbr.state = BBRProbeRTT
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 10_000_000
+	bbr.minRTT = 40 * time.Millisecond
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
