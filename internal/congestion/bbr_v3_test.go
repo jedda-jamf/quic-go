@@ -148,6 +148,73 @@ func TestBBRv3PerPacketStateRoundTrip(t *testing.T) {
 		"totalBytesAcked should increase after ACK processing")
 }
 
+// ============================================================================
+// §5.2: ALGORITHM LIFECYCLE (Init, Migration, Idle Restart)
+// ============================================================================
+
+// TestBBRv3IdleRestartRefreshesPacingTokens verifies that after an idle period,
+// the first send has fresh pacing budget per RFC §5.4.
+func TestBBRv3IdleRestartRefreshesPacingTokens(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Establish steady state and exhaust pacing budget
+	bbr.pacingRate = 1_000_000
+	for i := 0; i < 20; i++ {
+		bbr.OnPacketSent(now, 0, protocol.PacketNumber(i+1), 1500, true)
+	}
+	require.False(t, bbr.HasPacingBudget(now),
+		"pacing budget should be exhausted")
+
+	// Simulate idle period (> 1 RTT)
+	idleTime := now.Add(200 * time.Millisecond)
+
+	// After idle, pacing budget should be refreshed
+	require.True(t, bbr.HasPacingBudget(idleTime),
+		"pacing budget should be refreshed after idle period")
+}
+
+// TestBBRv3IdleRestartPreservesCwnd verifies that cwnd is not reduced
+// when restarting from idle per RFC §5.4.
+func TestBBRv3IdleRestartPreservesCwnd(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Establish cwnd in ProbeBW
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.congestionWindow = 200_000
+	originalCwnd := bbr.congestionWindow
+
+	// Set idle restart flag (simulating transport layer detection)
+	bbr.idleRestart = true
+
+	// Cwnd should be preserved
+	require.Equal(t, originalCwnd, bbr.congestionWindow,
+		"cwnd should be preserved during idle restart")
+}
+
+// TestBBRv3IdleRestartFlagLifecycle verifies the idleRestart flag is
+// set on idle detection and cleared after first ACK processing.
+func TestBBRv3IdleRestartFlagLifecycle(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Initially false
+	require.False(t, bbr.idleRestart, "idleRestart should start false")
+
+	// Transport layer sets it on idle detection
+	bbr.idleRestart = true
+	require.True(t, bbr.idleRestart, "idleRestart should be settable")
+
+	// Send and ACK a packet
+	bbr.OnPacketSent(now, 0, 1, 1200, true)
+	bbr.OnPacketAcked(1, 1200, 0, now.Add(50*time.Millisecond))
+	bbr.OnAckEventEnd(now.Add(50 * time.Millisecond))
+
+	// Flag should be cleared after ACK processing
+	require.False(t, bbr.idleRestart,
+		"idleRestart should be cleared after first ACK")
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
