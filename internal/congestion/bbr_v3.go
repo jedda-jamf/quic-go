@@ -1857,9 +1857,9 @@ func (bbr *BBRv3) setSendQuantum() {
 }
 
 func (bbr *BBRv3) setCwnd(rs bbrRateSample) {
-	target := bbr.targetCwnd(bbr.cwndGain)
+	// Per RFC §5.6.4.2, use maxInflight() which adds extra_acked BEFORE quantization.
+	target := bbr.maxInflight()
 	if bbr.fullBandwidthReached {
-		target += bbr.maxExtraAcked()
 		bbr.congestionWindow = min(bbr.congestionWindow+rs.newlyAcked, target)
 	} else if bbr.congestionWindow < target || protocol.ByteCount(bbr.totalBytesAcked) < bbr.initialCwnd {
 		bbr.congestionWindow += rs.newlyAcked
@@ -1894,6 +1894,23 @@ func (bbr *BBRv3) targetCwnd(gain float64) protocol.ByteCount {
 	inflight := bbr.inflightFromBWGain(bbr.boundedBandwidth(), gain)
 	inflight = bbr.quantizationBudget(inflight)
 	return inflight
+}
+
+// maxInflight implements BBRUpdateMaxInflight() per draft-05 §5.6.4.2:
+//
+//	inflight_cap = BBRBDPMultiple(BBR.cwnd_gain)
+//	inflight_cap += BBR.extra_acked
+//	BBR.max_inflight = BBRQuantizationBudget(inflight_cap)
+//
+// The key difference from targetCwnd is that extra_acked is added BEFORE
+// quantization, not after. This ensures the quantization floor (offload_budget,
+// min_pipe_cwnd, probe headroom) is applied to the sum of BDP and extra_acked.
+func (bbr *BBRv3) maxInflight() protocol.ByteCount {
+	inflight := bbr.inflightFromBWGain(bbr.boundedBandwidth(), bbr.cwndGain)
+	if bbr.fullBandwidthReached {
+		inflight += bbr.maxExtraAcked()
+	}
+	return bbr.quantizationBudget(inflight)
 }
 
 func (bbr *BBRv3) probeRTTCwnd() protocol.ByteCount {
