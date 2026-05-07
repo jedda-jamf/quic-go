@@ -540,6 +540,92 @@ func TestBBRv3LowerBoundsConstrainCwnd(t *testing.T) {
 		"cwnd should be bounded by inflightLo")
 }
 
+// TestBBRv3GainTableRFCCompliance verifies all state/phase gain values
+// match RFC draft-ietf-ccwg-bbr-05 §5.6.1.
+func TestBBRv3GainTableRFCCompliance(t *testing.T) {
+	gainTests := []struct {
+		name       string
+		rfcSection string
+		state      BBRState
+		phase      bbrProbeBWPhase
+		pacingGain float64
+		cwndGain   float64
+	}{
+		{"Startup", "§5.3.1", BBRStartup, 0, STARTUP_PACING_GAIN, STARTUP_CWND_GAIN},
+		{"Drain", "§5.3.2", BBRDrain, 0, DRAIN_PACING_GAIN, STARTUP_CWND_GAIN},
+		{"ProbeBW_DOWN", "§5.3.3.4", BBRProbeBW, probeBWDown, PROBE_BW_DOWN_GAIN, CWND_GAIN_DEFAULT},
+		{"ProbeBW_CRUISE", "§5.3.3.5", BBRProbeBW, probeBWCruise, PROBE_BW_BASE_GAIN, CWND_GAIN_DEFAULT},
+		{"ProbeBW_REFILL", "§5.3.3.5.3", BBRProbeBW, probeBWRefill, PROBE_BW_BASE_GAIN, CWND_GAIN_DEFAULT},
+		{"ProbeBW_UP", "§5.3.3.6", BBRProbeBW, probeBWUp, PROBE_BW_UP_GAIN, PROBE_BW_UP_CWND_GAIN},
+		{"ProbeRTT", "§5.3.4", BBRProbeRTT, 0, 1.0, PROBE_RTT_CWND_GAIN},
+	}
+
+	for _, tc := range gainTests {
+		t.Run(tc.name, func(t *testing.T) {
+			bbr := newTestBBRv3()
+			bbr.state = tc.state
+			if tc.state == BBRProbeBW {
+				bbr.probeBWPhase = tc.phase
+			}
+			bbr.updateGains()
+
+			require.InDelta(t, tc.pacingGain, bbr.pacingGain, 0.001,
+				"RFC %s: %s pacing_gain mismatch", tc.rfcSection, tc.name)
+			require.InDelta(t, tc.cwndGain, bbr.cwndGain, 0.001,
+				"RFC %s: %s cwnd_gain mismatch", tc.rfcSection, tc.name)
+		})
+	}
+}
+
+// TestBBRv3StateTransitionSetsCorrectGains verifies state entry functions
+// set correct gains (not just updateGains in isolation).
+func TestBBRv3StateTransitionSetsCorrectGains(t *testing.T) {
+	t.Run("enterDrain", func(t *testing.T) {
+		bbr := newTestBBRv3()
+		now := monotime.Now()
+		bbr.state = BBRStartup
+		bbr.fullBandwidthReached = true
+		bbr.bwHi[0] = 10_000_000
+		bbr.minRTT = 40 * time.Millisecond
+		bbr.roundStart = true
+
+		// Trigger Drain entry via checkDrain
+		bbr.checkDrain(bbrRateSample{bytesInFlight: 10_000_000}, now)
+		require.Equal(t, BBRDrain, bbr.state)
+
+		// updateGains is called after state transition in updateModel
+		bbr.updateGains()
+
+		require.InDelta(t, DRAIN_PACING_GAIN, bbr.pacingGain, 0.001,
+			"Drain pacing_gain should be DRAIN_PACING_GAIN")
+		require.InDelta(t, STARTUP_CWND_GAIN, bbr.cwndGain, 0.001,
+			"Drain cwnd_gain should be STARTUP_CWND_GAIN")
+	})
+
+	t.Run("enterProbeRTT", func(t *testing.T) {
+		rttStats := utils.NewRTTStats()
+		rttStats.UpdateRTT(40*time.Millisecond, 0)
+		bbr := NewBBRV3(DefaultClock{}, rttStats, nil, initialMaxDatagramSize, false, nil)
+		setupProbeBWPhase(bbr, probeBWCruise)
+
+		// Trigger ProbeRTT entry via updateMinRTT (expired timer)
+		now := monotime.Now()
+		bbr.probeRTTMinStamp = now.Add(-PROBE_RTT_INTERVAL - time.Millisecond)
+		bbr.idleRestart = false
+		bbr.pendingNewestSentTime = now.Add(-40 * time.Millisecond)
+		bbr.updateMinRTT(now)
+		require.Equal(t, BBRProbeRTT, bbr.state)
+
+		// updateGains is called after state transition in updateModel
+		bbr.updateGains()
+
+		require.InDelta(t, 1.0, bbr.pacingGain, 0.001,
+			"ProbeRTT pacing_gain should be 1.0")
+		require.InDelta(t, PROBE_RTT_CWND_GAIN, bbr.cwndGain, 0.001,
+			"ProbeRTT cwnd_gain should be PROBE_RTT_CWND_GAIN")
+	})
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
