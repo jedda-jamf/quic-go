@@ -1574,10 +1574,15 @@ func (bbr *BBRv3) pickProbeWait() {
 
 // updateMinRTT implements min_rtt tracking and ProbeRTT state per RFC §5.3.4.
 func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
-	if bbr.rttStats == nil {
-		return
+	// Per draft-ietf-ccwg-bbr-05 §5.3.4.3, use the RTT from the current ACK event,
+	// not LatestRTT which may be stale if this ACK didn't update rttStats.
+	rttSample := time.Duration(0)
+	if !bbr.pendingNewestSentTime.IsZero() {
+		rttSample = now.Sub(bbr.pendingNewestSentTime)
 	}
-	rttSample := bbr.rttStats.LatestRTT()
+	// Guard: rttSample <= 0 means pendingNewestSentTime is unset/zero, or clock
+	// went backwards. A zero or negative sample is not a valid basis for min_rtt
+	// or ProbeRTT scheduling.
 	if rttSample <= 0 {
 		return
 	}

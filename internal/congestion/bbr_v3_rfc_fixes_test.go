@@ -39,6 +39,8 @@ func TestBBRv3GuardrailProbeRTTUsesAckEventInflightAfterLoss(t *testing.T) {
 	bbr.pendingAckedBytes = 2 * bbr.maxDatagramSize
 	bbr.ackEventTime = now
 	bbr.ackEventBytesInFlight = 6 * bbr.maxDatagramSize
+	// H2: updateMinRTT now uses per-event RTT from pendingNewestSentTime
+	bbr.pendingNewestSentTime = now.Add(-25 * time.Millisecond)
 
 	bbr.updateMinRTT(now)
 
@@ -273,4 +275,51 @@ func TestBBRv3NonCollidedPacketsUnaffected(t *testing.T) {
 	require.Greater(t, bbr.totalBytesAcked, initialAcked)
 	// Packet should be removed from tracking after ACK
 	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(1))
+}
+
+// =============================================================================
+// H2: PER-EVENT RTT FOR updateMinRTT TESTS
+// =============================================================================
+
+// TestBBRv3UpdateMinRTTUsesPerEventRTT verifies that updateMinRTT uses the
+// per-event RTT calculated from pendingNewestSentTime (the newest packet's
+// send time in the ACK event), not the potentially stale rttStats.LatestRTT().
+// Per draft-ietf-ccwg-bbr-05 §5.3.4.3, BBRUpdateMinRTT should use the RTT
+// from the current ACK event.
+func TestBBRv3UpdateMinRTTUsesPerEventRTT(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Send a packet
+	bbr.OnPacketSent(now, 0, 1, 1200, true)
+
+	// ACK it 50ms later
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnPacketAcked(1, 1200, 0, ackTime)
+	bbr.OnAckEventEnd(ackTime)
+
+	// minRTT should be ~50ms (the actual RTT of this packet)
+	require.InDelta(t, 50*time.Millisecond, bbr.minRTT, float64(5*time.Millisecond),
+		"minRTT should be based on per-event RTT calculation")
+}
+
+// TestBBRv3UpdateMinRTTEmptyEventGuard verifies that updateMinRTT correctly
+// handles empty ACK events (where pendingNewestSentTime is zero) by early
+// returning without modifying minRTT. This prevents invalid RTT samples
+// from corrupting the min_rtt filter.
+func TestBBRv3UpdateMinRTTEmptyEventGuard(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set an initial minRTT
+	bbr.minRTT = 100 * time.Millisecond
+	initialMinRTT := bbr.minRTT
+
+	// Call updateMinRTT with zero pendingNewestSentTime (no packets in event)
+	bbr.pendingNewestSentTime = 0
+	bbr.updateMinRTT(now)
+
+	// minRTT should be unchanged - empty event should early return
+	require.Equal(t, initialMinRTT, bbr.minRTT,
+		"empty event should not update minRTT")
 }

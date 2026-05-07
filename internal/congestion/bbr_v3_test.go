@@ -378,6 +378,8 @@ func TestBBRv3ProbeRTTEnterExitAndIdleRestartSuppression(t *testing.T) {
 	bbr.probeRTTMinStamp = now.Add(-PROBE_RTT_INTERVAL - time.Millisecond)
 	originalCwnd := bbr.congestionWindow
 
+	// H2: updateMinRTT now uses per-event RTT from pendingNewestSentTime
+	bbr.pendingNewestSentTime = now.Add(-25 * time.Millisecond)
 	bbr.updateMinRTT(now)
 	require.Equal(t, BBRProbeRTT, bbr.state)
 	require.Equal(t, originalCwnd, bbr.priorCwnd)
@@ -386,10 +388,12 @@ func TestBBRv3ProbeRTTEnterExitAndIdleRestartSuppression(t *testing.T) {
 	t1 := now
 	bbr.probeRTTRoundDone = false
 	bbr.roundStart = false
+	bbr.pendingNewestSentTime = t1.Add(PROBE_RTT_DURATION + time.Millisecond - 25*time.Millisecond)
 	bbr.updateMinRTT(t1.Add(PROBE_RTT_DURATION + time.Millisecond))
 	require.Equal(t, BBRProbeRTT, bbr.state)
 
 	bbr.roundStart = true
+	bbr.pendingNewestSentTime = t1.Add(PROBE_RTT_DURATION + 2*time.Millisecond - 25*time.Millisecond)
 	bbr.updateMinRTT(t1.Add(PROBE_RTT_DURATION + 2*time.Millisecond))
 	require.Equal(t, BBRProbeBW, bbr.state)
 	require.GreaterOrEqual(t, bbr.congestionWindow, originalCwnd)
@@ -400,6 +404,8 @@ func TestBBRv3ProbeRTTEnterExitAndIdleRestartSuppression(t *testing.T) {
 	idleRestart.state = BBRProbeBW
 	idleRestart.idleRestart = true
 	idleRestart.probeRTTMinStamp = now.Add(-PROBE_RTT_INTERVAL - time.Millisecond)
+	// H2: updateMinRTT now uses per-event RTT from pendingNewestSentTime
+	idleRestart.pendingNewestSentTime = now.Add(-20 * time.Millisecond)
 	idleRestart.updateMinRTT(now)
 	require.NotEqual(t, BBRProbeRTT, idleRestart.state)
 }
@@ -806,6 +812,8 @@ func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
 	// Trigger ProbeRTT entry (timer expired)
 	bbr.probeRTTMinStamp = now.Add(-PROBE_RTT_INTERVAL - time.Millisecond)
 	bbr.idleRestart = false
+	// H2: updateMinRTT now uses per-event RTT from pendingNewestSentTime
+	bbr.pendingNewestSentTime = now.Add(-40 * time.Millisecond)
 	bbr.updateMinRTT(now)
 	require.Equal(t, BBRProbeRTT, bbr.state, "should enter ProbeRTT")
 
@@ -814,6 +822,7 @@ func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
 	bbr.probeRTTRoundDone = true
 	bbr.roundStart = true
 	exitTime := now.Add(PROBE_RTT_DURATION + time.Millisecond)
+	bbr.pendingNewestSentTime = exitTime.Add(-40 * time.Millisecond)
 	bbr.updateMinRTT(exitTime)
 
 	// Must exit to ProbeBW, not Startup
@@ -860,6 +869,8 @@ func TestBBRv3GuardrailProbeRTTRefreshesAppLimitedBubble(t *testing.T) {
 	bbr.appLimitedUntil = 0 // Simulate the ProbeRTT bubble having expired on a prior ACK.
 	bbr.pendingPriorInFlight = 12 * bbr.maxDatagramSize
 	bbr.pendingAckedBytes = 4 * bbr.maxDatagramSize
+	// H2: updateMinRTT now uses per-event RTT from pendingNewestSentTime
+	bbr.pendingNewestSentTime = now.Add(-25 * time.Millisecond)
 
 	expectedBubble := bbr.totalBytesAcked + uint64(8*bbr.maxDatagramSize)
 	bbr.updateMinRTT(now)
