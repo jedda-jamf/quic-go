@@ -311,6 +311,151 @@ func TestBBRv3CwndQuantizationFloor(t *testing.T) {
 		"cwnd target should respect minPipeCwnd floor")
 }
 
+// ============================================================================
+// RFC §5.3.3.6.4: ECN ALPHA CALCULATION
+// ============================================================================
+
+// TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha
+// per RFC §5.3.3.6.4: alpha = (1-g)*alpha + g*(CE/acked), g=1/16.
+func TestBBRv3ECNAlphaCalculation(t *testing.T) {
+	tests := []struct {
+		name          string
+		initialAlpha  float64
+		ceBytes       uint64
+		ackedBytes    uint64
+		expectedAlpha float64
+		tolerance     float64
+	}{
+		{
+			name:          "decay with 0% CE",
+			initialAlpha:  1.0,
+			ceBytes:       0,
+			ackedBytes:    1000,
+			expectedAlpha: 0.9375, // (1 - 1/16) * 1.0 + (1/16) * 0
+			tolerance:     0.001,
+		},
+		{
+			name:          "rise with 50% CE",
+			initialAlpha:  0.0,
+			ceBytes:       500,
+			ackedBytes:    1000,
+			expectedAlpha: 0.03125, // (1 - 1/16) * 0 + (1/16) * 0.5
+			tolerance:     0.001,
+		},
+		{
+			name:          "stable at 50%",
+			initialAlpha:  0.5,
+			ceBytes:       500,
+			ackedBytes:    1000,
+			expectedAlpha: 0.5, // converged
+			tolerance:     0.001,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bbr := newTestBBRv3()
+			bbr.ecnEligible = true
+			bbr.minRTT = 3 * time.Millisecond // Enable ECN
+			bbr.ecnAlpha = tc.initialAlpha
+			bbr.alphaLastDelivered = 0
+			bbr.alphaLastDeliveredCE = 0
+			bbr.totalBytesAcked = tc.ackedBytes
+			bbr.totalBytesAckedCE = tc.ceBytes
+
+			// Trigger alpha update
+			bbr.roundStart = true
+			bbr.updateECNAlpha(bbrRateSample{})
+
+			require.InDelta(t, tc.expectedAlpha, bbr.ecnAlpha, tc.tolerance,
+				"ecnAlpha should match expected value")
+		})
+	}
+}
+
+// TestBBRv3ECNAlphaBounds verifies ecnAlpha stays in [0, 1] range.
+func TestBBRv3ECNAlphaBounds(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.ecnEligible = true
+	bbr.minRTT = 3 * time.Millisecond
+
+	// 100% CE marking over multiple rounds
+	for i := 0; i < 100; i++ {
+		bbr.alphaLastDelivered = bbr.totalBytesAcked
+		bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
+		bbr.totalBytesAcked += 1000
+		bbr.totalBytesAckedCE += 1000
+		bbr.roundStart = true
+		bbr.updateECNAlpha(bbrRateSample{})
+	}
+	require.LessOrEqual(t, bbr.ecnAlpha, 1.0,
+		"ecnAlpha should not exceed 1.0")
+	require.GreaterOrEqual(t, bbr.ecnAlpha, 0.9,
+		"ecnAlpha should approach 1.0 with 100% CE")
+
+	// 0% CE marking
+	bbr.ecnAlpha = 0.5
+	for i := 0; i < 100; i++ {
+		bbr.alphaLastDelivered = bbr.totalBytesAcked
+		bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
+		bbr.totalBytesAcked += 1000
+		// No CE bytes added
+		bbr.roundStart = true
+		bbr.updateECNAlpha(bbrRateSample{})
+	}
+	require.GreaterOrEqual(t, bbr.ecnAlpha, 0.0,
+		"ecnAlpha should not go below 0.0")
+	require.LessOrEqual(t, bbr.ecnAlpha, 0.1,
+		"ecnAlpha should approach 0.0 with 0% CE")
+}
+
+// TestBBRv3ECNAlphaConvergence verifies alpha converges to marking rate.
+func TestBBRv3ECNAlphaConvergence(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.ecnEligible = true
+	bbr.minRTT = 3 * time.Millisecond
+	bbr.ecnAlpha = 0.0
+
+	// Sustained 50% CE marking
+	for i := 0; i < 200; i++ {
+		bbr.alphaLastDelivered = bbr.totalBytesAcked
+		bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
+		bbr.totalBytesAcked += 1000
+		bbr.totalBytesAckedCE += 500
+		bbr.roundStart = true
+		bbr.updateECNAlpha(bbrRateSample{})
+	}
+
+	require.InDelta(t, 0.5, bbr.ecnAlpha, 0.05,
+		"ecnAlpha should converge to ~0.5 with sustained 50% CE")
+}
+
+// TestBBRv3ECNAlphaReducesInflightLo verifies ECN alpha affects inflightLo
+// reduction per RFC §5.5.10.2: inflightLo *= (1 - ecnAlpha * ECN_FACTOR).
+func TestBBRv3ECNAlphaReducesInflightLo(t *testing.T) {
+	bbr := newTestBBRv3()
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.ecnEligible = true
+	bbr.ecnAlpha = 0.5
+	bbr.inflightLo = 100_000
+	bbr.inflightLatest = 50_000
+	bbr.ecnInRound = true
+	bbr.lossInRound = false
+	bbr.lossRoundStart = true
+
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	// Expected: inflightLo *= (1 - 0.5 * ECN_FACTOR)
+	// ECN_FACTOR = 1/3, so inflightLo *= (1 - 0.5 * 1/3) = (1 - 1/6) = 5/6
+	// 100_000 * 5/6 = 83_333
+	// But also max with inflightLatest = 50_000, so result is 83_333
+	ecnFactor := 1.0 / 3.0
+	expected := protocol.ByteCount(float64(100_000) * (1.0 - 0.5*ecnFactor))
+	expected = max(expected, bbr.inflightLatest)
+	require.Equal(t, expected, bbr.inflightLo,
+		"inflightLo should be reduced by ecnAlpha * ECN_FACTOR")
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
