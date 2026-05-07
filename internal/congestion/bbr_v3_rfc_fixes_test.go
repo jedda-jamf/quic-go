@@ -643,3 +643,41 @@ func TestBBRv3SaveCwndPinsRoundScopedPredicate(t *testing.T) {
 	require.Equal(t, protocol.ByteCount(80_000), bbr.priorCwnd,
 		"without lossInRound, priorCwnd = cwnd (round-scoped predicate)")
 }
+
+// =============================================================================
+// M6a: SPURIOUS LOSS PER-PACKET SEMANTICS PIN TEST
+// =============================================================================
+
+// TestBBRv3SpuriousLossPinsPerPacketSemantics pins the per-packet spurious loss
+// detection behavior. Draft-ietf-ccwg-bbr-05 §5.2.5 / §5.5.11 specify episode-level
+// semantics (undo only when entire episode is spurious), but the current implementation
+// restores model bounds on the first spurious packet detection.
+func TestBBRv3SpuriousLossPinsPerPacketSemantics(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up known model state
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+	bbr.inflightHi = 100_000
+	bbr.congestionWindow = 80_000
+	bbr.lossInRound = true
+
+	// Save state as if loss just occurred
+	bbr.undoBwLo = 800_000
+	bbr.undoInflightLo = 80_000
+	bbr.undoInflightHi = 150_000
+	bbr.undoCwnd = 120_000
+
+	// Call OnSpuriousLossDetected for a single packet
+	bbr.OnSpuriousLossDetected(1, 1)
+
+	// Per-packet semantics: bounds should be restored immediately
+	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo,
+		"bwLo should be restored to max(current, saved)")
+	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo,
+		"inflightLo should be restored")
+	require.Equal(t, protocol.ByteCount(150_000), bbr.inflightHi,
+		"inflightHi should be restored")
+	require.False(t, bbr.lossInRound,
+		"lossInRound should be cleared")
+}
