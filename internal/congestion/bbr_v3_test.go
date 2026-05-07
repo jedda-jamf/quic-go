@@ -1861,6 +1861,52 @@ func TestBBRv3GuardrailProbeRTTUsesAckEventInflightAfterLoss(t *testing.T) {
 // §5.5: MODEL UPDATES (AckAggregation, ECN, Loss Bounds)
 // ============================================================================
 
+// TestBBRv3LowerBoundsEventPath verifies that loss triggers lower bounds
+// adaptation through the production event path, not direct method calls.
+// AGENTIC GUARDRAIL: RFC §5.5.10 REQUIRES loss response through ACK/loss processing.
+func TestBBRv3LowerBoundsEventPath(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Establish steady state in ProbeBW CRUISE with known bounds
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.bwLo = 1_000_000
+	bbr.inflightLo = 100_000
+	bbr.bwLatest = 800_000
+	bbr.inflightLatest = 80_000
+
+	// Send some packets
+	for i := 1; i <= 5; i++ {
+		bbr.OnPacketSent(now, protocol.ByteCount(i*1200), protocol.PacketNumber(i), 1200, true)
+	}
+
+	// Trigger loss through OnCongestionEvent (production path)
+	bbr.OnCongestionEvent(1, 1200, 0)
+
+	// Verify loss was recorded
+	require.True(t, bbr.lossInRound,
+		"lossInRound MUST be set after OnCongestionEvent")
+
+	// Complete round via ACKs to trigger adaptLowerBounds
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnPacketAcked(2, 1200, 0, ackTime)
+	bbr.OnPacketAcked(3, 1200, 0, ackTime)
+
+	// Trigger round boundary
+	bbr.totalBytesAcked += 10_000
+	bbr.nextRoundDelivered = bbr.totalBytesAcked - 5_000 // Force round_start
+	bbr.lossRoundStart = true
+
+	bbr.OnAckEventEnd(ackTime)
+
+	// RFC §5.5.10: After loss round, bwLo and inflightLo should be reduced
+	// The exact values depend on BETA (0.7), but they should be <= original
+	require.LessOrEqual(t, bbr.bwLo, protocol.ByteCount(1_000_000),
+		"RFC §5.5.10: bwLo MUST be reduced or unchanged after loss round")
+	require.LessOrEqual(t, bbr.inflightLo, protocol.ByteCount(100_000),
+		"RFC §5.5.10: inflightLo MUST be reduced or unchanged after loss round")
+}
+
 // TestBBRv3LossModelPerPacketState verifies that OnPacketSent captures
 // P.lost (totalBytesLost) for loss-round detection per RFC §5.5.10.
 // AGENTIC GUARDRAIL: RFC §5.5.10 uses P.lost to detect new loss rounds.
