@@ -610,3 +610,36 @@ func TestBBRv3OnRetransmissionTimeoutNoOp(t *testing.T) {
 	require.Equal(t, initialPTORecovery, bbr.ptoRecovery,
 		"ptoRecovery should not change on OnRetransmissionTimeout")
 }
+
+// =============================================================================
+// L7: saveCwnd DIVERGENCE PIN TEST
+// =============================================================================
+
+// TestBBRv3SaveCwndPinsRoundScopedPredicate pins the round-scoped lossInRound
+// predicate used by saveCwnd. Draft-ietf-ccwg-bbr-05 §5.6.4.4 uses
+// !InLossRecovery() which spans the entire recovery episode, while this
+// implementation uses !lossInRound which resets each round. The difference
+// allows faster cwnd restoration during long recovery episodes.
+func TestBBRv3SaveCwndPinsRoundScopedPredicate(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up state: in ProbeBW, with loss in round
+	bbr.state = BBRProbeBW
+	bbr.lossInRound = true
+	bbr.congestionWindow = 100_000
+	bbr.priorCwnd = 50_000 // Lower than current cwnd
+
+	// saveCwnd with lossInRound=true should preserve max(priorCwnd, cwnd)
+	bbr.saveCwnd()
+	require.Equal(t, protocol.ByteCount(100_000), bbr.priorCwnd,
+		"with lossInRound, priorCwnd = max(priorCwnd, cwnd)")
+
+	// Reset lossInRound (simulating round boundary)
+	bbr.lossInRound = false
+	bbr.congestionWindow = 80_000
+
+	// saveCwnd with lossInRound=false should capture current cwnd
+	bbr.saveCwnd()
+	require.Equal(t, protocol.ByteCount(80_000), bbr.priorCwnd,
+		"without lossInRound, priorCwnd = cwnd (round-scoped predicate)")
+}
