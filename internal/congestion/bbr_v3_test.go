@@ -215,6 +215,102 @@ func TestBBRv3IdleRestartFlagLifecycle(t *testing.T) {
 		"idleRestart should be cleared after first ACK")
 }
 
+// ============================================================================
+// §5.5.8 and §5.6.3: SEND QUANTUM AND OFFLOAD BUDGET
+// ============================================================================
+
+// TestBBRv3SendQuantumCalculation verifies send_quantum = min(pacing_rate * 1ms, 64KB)
+// with a floor of 2*MSS per RFC §5.6.3.
+func TestBBRv3SendQuantumCalculation(t *testing.T) {
+	tests := []struct {
+		name        string
+		pacingRate  protocol.ByteCount
+		expected    protocol.ByteCount
+		description string
+	}{
+		{
+			name:        "Low rate (hits 2*MSS floor)",
+			pacingRate:  10_000, // 10 KB/s * 1ms = 10 bytes
+			expected:    2 * 1280,
+			description: "sendQuantum should hit floor of 2*MSS (2560 bytes)",
+		},
+		{
+			name:        "1 MB/s rate (hits 2*MSS floor)",
+			pacingRate:  1_000_000, // 1 MB/s * 1ms = 1000 bytes
+			expected:    2 * 1280,
+			description: "sendQuantum should hit floor of 2*MSS (2560 bytes)",
+		},
+		{
+			name:        "10 MB/s rate (above floor)",
+			pacingRate:  10_000_000, // 10 MB/s * 1ms = 10000 bytes
+			expected:    10_000,
+			description: "sendQuantum should be 10000 bytes",
+		},
+		{
+			name:        "100 MB/s rate (capped at 64KB)",
+			pacingRate:  100_000_000, // 100 MB/s * 1ms = 100000 bytes
+			expected:    64 * 1024,
+			description: "sendQuantum should be capped at 64KB",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bbr := newTestBBRv3()
+			bbr.pacingRate = tc.pacingRate
+			bbr.setSendQuantum()
+
+			require.Equal(t, tc.expected, bbr.sendQuantum, tc.description)
+		})
+	}
+}
+
+// TestBBRv3OffloadBudgetCalculation verifies offload_budget = send_quantum
+// per RFC §5.5.8.2 (QUIC non-offloaded case).
+func TestBBRv3OffloadBudgetCalculation(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.pacingRate = 1_000_000 // 1 MB/s -> sendQuantum = 1000
+	bbr.setSendQuantum()
+
+	// Per RFC §5.5.8.2: QUIC (non-offloaded) uses offload_budget = send_quantum
+	require.Equal(t, bbr.sendQuantum, bbr.offloadBudget,
+		"offload_budget should equal send_quantum for QUIC")
+}
+
+// TestBBRv3QuantizationBudgetFloors verifies quantizationBudget returns
+// max of inflight, offload_budget, minPipeCwnd per RFC §5.6.4.2.
+func TestBBRv3QuantizationBudgetFloors(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Low pacing rate to make floors visible
+	bbr.pacingRate = 1_000 // 1 KB/s -> sendQuantum very small
+	bbr.setSendQuantum()
+
+	// Test with tiny inflight value
+	floor := bbr.quantizationBudget(100)
+
+	// Should be at least minPipeCwnd (4 * MSS = 4 * 1280 = 5120)
+	require.GreaterOrEqual(t, floor, bbr.minPipeCwnd,
+		"quantization floor should be at least minPipeCwnd")
+}
+
+// TestBBRv3CwndQuantizationFloor verifies cwnd respects quantization floor
+// even with very small BDP.
+func TestBBRv3CwndQuantizationFloor(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Very small BDP scenario: 10 KB/s * 10ms = 100 bytes
+	bbr.bwHi[0] = 10_000
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.fullBandwidthReached = true
+	bbr.cwndGain = CWND_GAIN_DEFAULT
+
+	// Even with tiny BDP, cwnd should not go below minPipeCwnd
+	target := bbr.targetCwnd(CWND_GAIN_DEFAULT)
+	require.GreaterOrEqual(t, target, bbr.minPipeCwnd,
+		"cwnd target should respect minPipeCwnd floor")
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
