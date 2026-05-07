@@ -1780,6 +1780,26 @@ func TestBBRv3GuardrailProbeRTTUsesAckEventInflightAfterLoss(t *testing.T) {
 // §5.5: MODEL UPDATES (AckAggregation, ECN, Loss Bounds)
 // ============================================================================
 
+// TestBBRv3LossModelPerPacketState verifies that OnPacketSent captures
+// P.lost (totalBytesLost) for loss-round detection per RFC §5.5.10.
+// AGENTIC GUARDRAIL: RFC §5.5.10 uses P.lost to detect new loss rounds.
+func TestBBRv3LossModelPerPacketState(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up known loss state before sending
+	bbr.totalBytesLost = 5_000
+
+	bbr.OnPacketSent(now, 10_000, 1, 1200, true)
+
+	st, ok := bbr.sentPackets[1]
+	require.True(t, ok, "packet state should be tracked")
+
+	// RFC §5.5.10: P.lost captures C.lost at send time for loss-round detection
+	require.Equal(t, uint64(5_000), st.totalBytesLost,
+		"RFC §5.5.10: P.lost MUST equal C.lost at send time for loss-round detection")
+}
+
 func TestBBRv3AckAggregationRaisesCwndTarget(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.state = BBRProbeBW
