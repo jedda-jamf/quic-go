@@ -395,3 +395,45 @@ func TestBBRv3UpdateMinRTTEmptyEventGuard(t *testing.T) {
 	require.Equal(t, initialMinRTT, bbr.minRTT,
 		"empty event should not update minRTT")
 }
+
+// =============================================================================
+// M2: EXTRA_ACKED ROTATION WINDOW TESTS
+// =============================================================================
+
+// TestBBRv3ExtraAckedRetentionWindow verifies that the extra_acked filter
+// rotates slots every 5 rounds (EXTRA_ACKED_WIN_RTS), so old samples are
+// evicted within ~10 rounds. This matches tcp_bbr.c bbr_extra_acked_win_rtts=5
+// with 2 slots, approximating the RFC's BBRExtraAckedFilterLen=10.
+func TestBBRv3ExtraAckedRetentionWindow(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Must be in ProbeBW (not Startup) to use the 5-round rotation
+	bbr.state = BBRProbeBW
+	bbr.fullBandwidthReached = true
+
+	// Record a large sample in slot 0
+	bbr.extraAcked[0] = 10000
+	bbr.extraAckedWinIdx = 0
+	bbr.extraAckedWinRTTs = 0
+
+	// After 5 rounds: rotates to slot 1, zeros slot 1, slot 0 still has 10000
+	// After 10 rounds: rotates to slot 0, zeros slot 0, slot 1 may have small values
+	// So we need 10+ rounds to evict the original sample from slot 0
+
+	// Simulate rounds - use minimal ACKs to avoid accumulating extra_acked
+	for round := 0; round < 11; round++ {
+		bbr.roundStart = true
+		// Reset ack epoch to prevent extra_acked accumulation
+		bbr.ackEpochAcked = 0
+		bbr.ackEpochStart = now.Add(time.Duration(round) * 100 * time.Millisecond)
+		rs := bbrRateSample{newlyAcked: 1} // minimal ACK
+		bbr.updateAckAggregation(rs, now.Add(time.Duration(round)*100*time.Millisecond))
+		bbr.roundStart = false
+	}
+
+	// With 5-round rotation, after 11 rounds (> 2*5), both slots should have
+	// been rotated and the original 10000 value evicted
+	require.Less(t, bbr.maxExtraAcked(), protocol.ByteCount(10000),
+		"original sample should be rotated out within 10 rounds")
+}
