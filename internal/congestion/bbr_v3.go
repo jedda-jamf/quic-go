@@ -170,9 +170,11 @@ const (
 	// See also: tcp_bbr.c pacing calculations
 	BBR_PACING_MARGIN = 0.99
 
-	// EXTRA_ACKED_WIN_RTS = 10 per RFC draft-ietf-ccwg-bbr-05 §5.5.9.
-	// The Startup-specific 1-RTT window is handled separately below.
-	EXTRA_ACKED_WIN_RTS = 10
+	// EXTRA_ACKED_WIN_RTS = 5 per Google BBRv3 tcp_bbr.c (bbr_extra_acked_win_rtts).
+	// Draft-ietf-ccwg-bbr-05 §5.5.9 specifies BBRExtraAckedFilterLen = 10 packet-timed
+	// round trips. The two-slot windowed-max approximation rotates every 5 rounds,
+	// covering ~5–10 rounds, which approximates the spec's 10-round filter length.
+	EXTRA_ACKED_WIN_RTS = 5
 
 	// EXTRA_ACKED_MAX_US = 100ms per tcp_bbr.c
 	// Max extra_acked contribution in time units.

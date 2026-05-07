@@ -1075,24 +1075,25 @@ func TestBBRv3GuardrailExtraAckedWindowInStartup(t *testing.T) {
 	// After rotation, the slot was cleared to 0, then updated with new sample
 	// The important thing is that the OLD values (10_000, 5_000) were rotated out
 
-	// Verify that in non-Startup state, it takes 10 RTTs to rotate
+	// Verify that in non-Startup state, it takes 5 RTTs to rotate
+	// (per tcp_bbr.c bbr_extra_acked_win_rtts=5, changed from 10)
 	bbr.state = BBRProbeBW
 	bbr.fullBandwidthReached = true
 	rotatedIdx := bbr.extraAckedWinIdx
 
-	// Simulate 9 more rounds (should NOT rotate with 10-RTT window)
-	for i := 0; i < 9; i++ {
+	// Simulate 4 more rounds (should NOT rotate with 5-RTT window)
+	for i := 0; i < 4; i++ {
 		bbr.roundStart = true
 		bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
 	}
 	require.Equal(t, rotatedIdx, bbr.extraAckedWinIdx,
-		"window should not rotate before 10 RTTs in ProbeBW")
+		"window should not rotate before 5 RTTs in ProbeBW")
 
-	// One more round (10th) should trigger rotation
+	// One more round (5th) should trigger rotation
 	bbr.roundStart = true
 	bbr.updateAckAggregation(bbrRateSample{newlyAcked: 1000}, now)
 	require.NotEqual(t, rotatedIdx, bbr.extraAckedWinIdx,
-		"window should rotate after 10 RTTs in ProbeBW")
+		"window should rotate after 5 RTTs in ProbeBW")
 }
 
 // TestBBRv3GuardrailZeroInflightFromAckEventStart verifies P1 fix:
