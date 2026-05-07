@@ -795,12 +795,14 @@ func (bbr *BBRv3) OnCongestionEvent(
 	}
 }
 
-// OnRetransmissionTimeout is called when a retransmission timeout occurs.
-func (bbr *BBRv3) OnRetransmissionTimeout(packetsRetransmitted bool) {
-	if !packetsRetransmitted {
-		return
-	}
-	bbr.enterTimeoutRecovery(0)
+// OnRetransmissionTimeout is a legacy hook on the SendAlgorithm interface.
+// QUIC ackhandler drives RTO/PTO recovery via OnPTO with bytesInFlight.
+// This method is intentionally a no-op for BBRv3.
+func (bbr *BBRv3) OnRetransmissionTimeout(_ bool) {
+	// The previous implementation called enterTimeoutRecovery(0), which
+	// violated §5.6.4.4's requirement that cwnd = inflight + 1 SMSS.
+	// Rather than pass incorrect state, we do nothing — the correct path
+	// is OnPTO, which receives bytesInFlight from the ackhandler.
 }
 
 func (bbr *BBRv3) OnPTO(bytesInFlight protocol.ByteCount) {
