@@ -191,6 +191,60 @@ func TestBBRv3InitialPacingRateGuardrail(t *testing.T) {
 		"initial pacing rate should be reasonable for 100ms RTT")
 }
 
+// TestBBRv3C1ExactPacingInterval verifies that the pacing interval exactly matches
+// maxDatagramSize / pacingRate, not maxDatagramSize / (pacingRate * 5/4). The C1 fix
+// pre-divides the rate by 5/4 so that after the pacer applies its 5/4 multiplier,
+// the effective rate equals BBR's intended pacing rate.
+func TestBBRv3C1ExactPacingInterval(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set a precise pacing rate: 1,000,000 bytes/s (1 MB/s)
+	bbr.pacingRate = 1_000_000
+
+	// Exhaust burst budget
+	for i := 0; i < 20; i++ {
+		bbr.OnPacketSent(now, 0, protocol.PacketNumber(i+1), 1500, true)
+	}
+
+	// The pacer calculates interval based on maxDatagramSize (1280 bytes).
+	// At 1 MB/s, a 1280-byte packet should take exactly 1.28ms
+	// packetSize / pacingRate = 1280 / 1_000_000 = 0.00128s = 1.28ms
+	//
+	// WITHOUT C1 fix: pacer would use rate * 5/4 = 1,250,000 bytes/s
+	// → interval = 1280 / 1_250_000 = 1.024ms (too fast)
+	//
+	// WITH C1 fix: BBR returns rate * 4/5 = 800,000, pacer applies * 5/4
+	// → effective = 800,000 * 5/4 = 1,000,000 bytes/s
+	// → interval = 1280 / 1_000_000 = 1.28ms (correct)
+
+	packetSize := bbr.maxDatagramSize // 1280 bytes
+	expectedInterval := time.Duration(float64(packetSize) / float64(bbr.pacingRate) * float64(time.Second))
+
+	// Set lastSentTime and zero the budget to force interval calculation
+	bbr.pacer.budgetAtLastSent = 0
+	bbr.pacer.lastSentTime = now
+
+	// TimeUntilSend should return now + expectedInterval (within timer granularity)
+	nextSend := bbr.TimeUntilSend(0)
+	actualInterval := nextSend.Sub(now)
+
+	// Allow for MinPacingDelay floor and integer rounding (±1μs)
+	minExpected := max(expectedInterval, protocol.MinPacingDelay) - time.Microsecond
+	maxExpected := max(expectedInterval, protocol.MinPacingDelay) + time.Microsecond
+
+	require.GreaterOrEqual(t, actualInterval, minExpected,
+		"pacing interval should be at least expectedInterval (1.28ms)")
+	require.LessOrEqual(t, actualInterval, maxExpected,
+		"pacing interval should be at most expectedInterval (not faster due to 5/4)")
+
+	// Verify the interval is NOT the uncorrected 1.024ms (what it would be without C1)
+	uncorrectedInterval := time.Duration(float64(packetSize) / (float64(bbr.pacingRate) * 1.25) * float64(time.Second))
+	// With C1 fix: 1.28ms, without: 1.024ms - difference is 0.256ms
+	require.Greater(t, actualInterval, uncorrectedInterval+100*time.Microsecond,
+		"interval should be slower than uncorrected rate * 5/4 by at least 100μs")
+}
+
 // =============================================================================
 // H1a: PN-SPACE COLLISION DETECTION TESTS
 // =============================================================================
@@ -316,6 +370,47 @@ func TestBBRv3ACKOnCollidedPNLeavesModelUntouched(t *testing.T) {
 	bbr.OnAckEventEnd(ackTime)
 	require.False(t, bbr.pendingECNEventValid,
 		"all-collided ACK event should clear stale ECN at end")
+}
+
+// TestBBRv3CollidedACKNoDeliveryRateSample is a regression test ensuring that
+// ACKing a collided PN does not generate a delivery rate sample. The bug that
+// prompted H1a allowed fabricated bbrSentPacketState to flow through the sampler,
+// poisoning max_bw when minRTT=0 during handshake.
+func TestBBRv3CollidedACKNoDeliveryRateSample(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Trigger collision on PN 0
+	bbr.OnPacketSent(now, 0, 0, 1200, true)
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1200, 0, 1200, true)
+	require.Contains(t, bbr.collisionPNs, protocol.PacketNumber(0))
+
+	// Verify pending ACK event bucket is empty before
+	require.False(t, bbr.pendingAckEventValid,
+		"no pending ACK event should exist before ACK")
+
+	// ACK the collided PN
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnPacketAcked(0, 1200, 0, ackTime)
+
+	// The pending ACK event bucket must remain empty - no sample should be created
+	require.False(t, bbr.pendingAckEventValid,
+		"pending ACK event should NOT be created for collided PN")
+	require.Equal(t, protocol.ByteCount(0), bbr.pendingAckedBytes,
+		"pendingAckedBytes should remain zero for collided PN")
+	require.True(t, bbr.pendingNewestSentTime.IsZero(),
+		"pendingNewestSentTime should remain zero for collided PN")
+
+	// Process the event end to verify no model update occurs
+	snapshotBwLatest := bbr.bwLatest
+	snapshotBwHi0 := bbr.bwHi[0]
+	bbr.OnAckEventEnd(ackTime)
+
+	// Model should be unchanged since no valid sample was generated
+	require.Equal(t, snapshotBwLatest, bbr.bwLatest,
+		"bwLatest should not change after event end")
+	require.Equal(t, snapshotBwHi0, bbr.bwHi[0],
+		"max_bw filter should not change after event end")
 }
 
 // TestBBRv3NonCollidedPacketsUnaffected verifies that packets with non-collided
