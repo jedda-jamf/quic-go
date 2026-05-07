@@ -169,3 +169,22 @@ func TestBBRv3FullChainPacingEquivalence(t *testing.T) {
 	require.True(t, bbr.HasPacingBudget(now.Add(2*time.Millisecond)),
 		"pacer should have budget after waiting for packet time")
 }
+
+func TestBBRv3InitialPacingRateGuardrail(t *testing.T) {
+	// Create BBRv3 through normal path (utils.NewRTTStats initializes to 100ms)
+	rttStats := utils.NewRTTStats()
+	bbr := NewBBRV3(DefaultClock{}, rttStats, nil, initialMaxDatagramSize, false, nil)
+
+	// Initial pacing rate should be based on 100ms RTT, not 1ms fallback
+	// initialCwnd = 32 * 1280 = 40960 bytes (initialCongestionWindow * InitialPacketSize)
+	// At 100ms RTT: nominal = 40960 / 0.1s = 409600 bytes/s
+	// With STARTUP_PACING_GAIN = 2.77: rate = 409600 * 2.77 = 1134592 bytes/s
+
+	// The 1ms fallback would give: 40960 / 0.001s * 2.77 = 113,459,200 bytes/s
+	// So if rate > 10,000,000, we're probably using the 1ms fallback
+
+	require.Less(t, bbr.pacingRate, protocol.ByteCount(10_000_000),
+		"initial pacing rate should use 100ms default RTT, not 1ms fallback")
+	require.Greater(t, bbr.pacingRate, protocol.ByteCount(500_000),
+		"initial pacing rate should be reasonable for 100ms RTT")
+}
