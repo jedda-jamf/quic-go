@@ -1685,11 +1685,19 @@ func (bbr *BBRv3) saveStateUponLoss() {
 	bbr.undoCwnd = bbr.congestionWindow
 }
 
-// OnSpuriousLossDetected implements SpuriousLossHandler.
-// Called when the transport detects that previously declared losses were spurious.
-// Per RFC §5.5.11.2 (BBRHandleSpuriousLossDetection), we restore model bounds
-// to their pre-loss values to undo loss-driven reductions that were triggered
-// by reordering rather than actual congestion.
+// OnSpuriousLossDetected reacts to spurious-loss signals at the per-packet
+// level. Draft-ietf-ccwg-bbr-05 §5.2.5 / §5.5.11 specify episode-level
+// semantics: the model should be undone only when an entire recovery episode
+// is determined to have been spurious, not on the first reordered packet.
+//
+// Current behavior: first spurious packet triggers model restoration.
+// Spec behavior: wait until entire episode is determined spurious.
+//
+// Implementing the spec correctly requires sent_packet_handler to expose
+// recovery-episode boundaries (episode start, episode end, episode-was-spurious)
+// to the congestion controller. This is tracked as a follow-up item.
+//
+// Pinned by TestBBRv3SpuriousLossPinsPerPacketSemantics.
 func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.PacketNumber) {
 	// The current transport hook delivers one callback per spuriously lost
 	// packet, so thresholds greater than 1 effectively disable this recovery
