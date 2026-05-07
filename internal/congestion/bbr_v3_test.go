@@ -112,39 +112,65 @@ func TestBBRv3RateSampleContract(t *testing.T) {
 	sendTime := monotime.Now()
 
 	// Initialize connection state with known values
-	bbr.totalBytesAcked = 10_000
+	initialDelivered := uint64(10_000)
+	bbr.totalBytesAcked = initialDelivered
 	bbr.deliveredTime = sendTime
 	bbr.firstSentTime = sendTime
 	bbr.appLimitedUntil = 0 // Not app-limited
 
-	// Send packet 1 at sendTime
+	// Send packet 1 at sendTime with bytesInFlight = 0
+	// This resets firstSentTime to sendTime (idle restart semantics)
 	bbr.OnPacketSent(sendTime, 0, 1, 1200, true)
 
-	// Advance time and simulate delivery progress before ACK
+	// Send packet 2 at sendTime + 10ms with bytesInFlight = 2400
+	// bytesInFlight > bytes (2400 > 1200) ensures priorInFlight > 0,
+	// so firstSentTime is inherited (not reset), creating send_elapsed > 0
+	sendTime2 := sendTime.Add(10 * time.Millisecond)
+	bbr.OnPacketSent(sendTime2, 2400, 2, 1200, true)
+
+	// ACK time is 50ms after sendTime
 	ackTime := sendTime.Add(50 * time.Millisecond)
 
-	// Send packet 2 at sendTime + 10ms (to create send_elapsed > 0)
-	sendTime2 := sendTime.Add(10 * time.Millisecond)
-	bbr.OnPacketSent(sendTime2, 1200, 2, 1200, true)
-
-	// ACK packet 1, then packet 2
+	// ACK packet 1 first - this establishes the rate sample baseline
 	bbr.OnPacketAcked(1, 1200, 0, ackTime)
+
+	// ACK packet 2 - this updates pending rate sample fields (newer sent time)
 	bbr.OnPacketAcked(2, 1200, 1200, ackTime)
 
-	// Process ACK event to compute rate sample
+	// VERIFY RATE SAMPLE FIELDS BEFORE OnAckEventEnd clears them
+	// These pending fields become the rate sample in processPendingAckEvent
+
+	// RFC §4.2: RS.send_elapsed = P.sent_time - P.first_sent_time
+	// Packet 2: sentTime = sendTime+10ms, firstSentTime = sendTime (inherited)
+	require.Equal(t, 10*time.Millisecond, bbr.pendingSendElapsed,
+		"RFC §4.2: RS.send_elapsed MUST equal P.sent_time - P.first_sent_time")
+
+	// RFC §4.2: RS.tx_in_flight = P.tx_in_flight (bytesInFlight when packet was sent)
+	// Packet 2 was sent with bytesInFlight = 2400
+	require.Equal(t, protocol.ByteCount(2400), bbr.pendingTxInFlight,
+		"RFC §4.2: RS.tx_in_flight MUST equal bytes_in_flight at send time")
+
+	// RFC §4.2: RS.is_app_limited = P.is_app_limited
+	// appLimitedUntil = 0 (or < delivered), so not app-limited
+	require.False(t, bbr.pendingIsAppLimited,
+		"RFC §4.2: RS.is_app_limited MUST reflect app-limited state at send time")
+
+	// RFC §4.2: RS.delivered = C.delivered - P.delivered
+	// pendingPriorDelivered = P.delivered for the newest packet (packet 2)
+	// Packet 2's P.delivered = totalBytesAcked at send time = 10_000 (unchanged)
+	require.Equal(t, initialDelivered, bbr.pendingPriorDelivered,
+		"RFC §4.2: pending state MUST track P.delivered from send time")
+
+	// Now process the ACK event to compute final rate sample
 	bbr.OnAckEventEnd(ackTime)
 
-	// RFC §4.2: After ACK processing, verify delivery rate was computed
-	// The delivery rate should be > 0 if packets were delivered
-	require.Greater(t, bbr.totalBytesAcked, uint64(10_000),
-		"RFC §4.2: totalBytesAcked MUST increase after ACK processing")
-
-	// Verify that a delivery rate sample was generated
-	// bwLatest is updated from the rate sample if interval >= minRTT
-	// For this test, we verify the ACK path completes without error
-	// and updates the delivered counters correctly
+	// RFC §4.2: After ACK processing, totalBytesAcked MUST increase
 	require.Equal(t, uint64(10_000+2400), bbr.totalBytesAcked,
 		"RFC §4.2: totalBytesAcked MUST equal prior + newly acked bytes")
+
+	// Verify pending fields were cleared after processing
+	require.Equal(t, time.Duration(0), bbr.pendingSendElapsed,
+		"pending fields MUST be cleared after OnAckEventEnd")
 }
 
 // TestBBRv3ShortIntervalSamplesKeepLatestDeliveryBookkeeping verifies that delivery
