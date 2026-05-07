@@ -2094,7 +2094,10 @@ func (bbr *BBRv3) maybeQlogStateChange() {
 		case BBRStartup:
 			state = qlog.CongestionStateSlowStart
 		case BBRDrain:
-			state = qlog.CongestionStateRecovery
+			// Drain is post-Startup queue drainage, not loss recovery. Map to
+			// congestion_avoidance for generic qlog consumers; recovery:bbr_state_updated
+			// is the authoritative event for BBR-specific state.
+			state = qlog.CongestionStateCongestionAvoidance
 		case BBRProbeBW:
 			state = qlog.CongestionStateCongestionAvoidance
 		case BBRProbeRTT:
