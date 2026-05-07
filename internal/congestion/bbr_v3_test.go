@@ -456,6 +456,90 @@ func TestBBRv3ECNAlphaReducesInflightLo(t *testing.T) {
 		"inflightLo should be reduced by ecnAlpha * ECN_FACTOR")
 }
 
+// TestBBRv3ProbeBWCruiseLossReducesBounds verifies loss in CRUISE reduces
+// bwLo and inflightLo by Beta (30%) per RFC §5.5.10.1.
+func TestBBRv3ProbeBWCruiseLossReducesBounds(t *testing.T) {
+	bbr := newTestBBRv3()
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.bwLo = 1_000_000
+	bbr.inflightLo = 100_000
+	bbr.bwLatest = 500_000
+	bbr.inflightLatest = 50_000
+	bbr.lossInRound = true
+	bbr.ecnInRound = false
+	bbr.lossRoundStart = true
+
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	// bwLo = max(bwLatest, bwLo * 0.7) = max(500_000, 700_000) = 700_000
+	require.Equal(t, protocol.ByteCount(700_000), bbr.bwLo,
+		"bwLo should be reduced by 30%% (Beta)")
+
+	// inflightLo = max(inflightLatest, inflightLo * 0.7) = max(50_000, 70_000) = 70_000
+	require.Equal(t, protocol.ByteCount(70_000), bbr.inflightLo,
+		"inflightLo should be reduced by 30%% (Beta)")
+}
+
+// TestBBRv3ProbeBWCruiseECNReducesInflightLo verifies ECN in CRUISE reduces
+// only inflightLo (not bwLo) per RFC §5.5.10.2.
+func TestBBRv3ProbeBWCruiseECNReducesInflightLo(t *testing.T) {
+	bbr := newTestBBRv3()
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.bwLo = 1_000_000
+	bbr.inflightLo = 100_000
+	bbr.inflightLatest = 50_000
+	bbr.ecnAlpha = 0.5
+	bbr.ecnInRound = true
+	bbr.lossInRound = false
+	bbr.lossRoundStart = true
+
+	initialBwLo := bbr.bwLo
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	// bwLo should NOT change (ECN doesn't affect bwLo)
+	require.Equal(t, initialBwLo, bbr.bwLo,
+		"bwLo should not change on ECN (only loss affects bwLo)")
+
+	// inflightLo should be reduced
+	require.Less(t, bbr.inflightLo, protocol.ByteCount(100_000),
+		"inflightLo should be reduced on ECN")
+}
+
+// TestBBRv3ProbeBWRefillClearsLowerBounds verifies entering REFILL resets
+// bwLo and inflightLo to MaxByteCount per RFC §5.3.3.5.3.
+func TestBBRv3ProbeBWRefillClearsLowerBounds(t *testing.T) {
+	bbr := newTestBBRv3()
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+
+	// Transition to REFILL
+	bbr.startProbeBWRefill(monotime.Now(), 0)
+
+	require.Equal(t, protocol.MaxByteCount, bbr.bwLo,
+		"bwLo should be reset to MaxByteCount in REFILL")
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo,
+		"inflightLo should be reset to MaxByteCount in REFILL")
+}
+
+// TestBBRv3LowerBoundsConstrainCwnd verifies inflightLo caps cwnd
+// per RFC §5.6.4.3.
+func TestBBRv3LowerBoundsConstrainCwnd(t *testing.T) {
+	bbr := newTestBBRv3()
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.bwHi[0] = 10_000_000
+	bbr.minRTT = 40 * time.Millisecond
+	bbr.inflightLo = 50_000 // Low constraint
+	bbr.congestionWindow = 200_000
+
+	// Apply inflight model bound
+	bbr.boundCwndForInflightModel()
+
+	// Cwnd should be capped at inflightLo + some headroom
+	require.LessOrEqual(t, bbr.congestionWindow, bbr.inflightLo+bbr.maxDatagramSize,
+		"cwnd should be bounded by inflightLo")
+}
+
 func TestBBRv3PacingBudget(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
