@@ -532,3 +532,61 @@ func TestBBRv3MaxInflightExtraAckedOrdering(t *testing.T) {
 	require.Equal(t, maxInf, expected,
 		"maxInflight should equal BDP*gain + extra_acked when above all floors")
 }
+
+// =============================================================================
+// M5: ACK_EPOCH_ACKED THRESHOLD SCALING TESTS
+// =============================================================================
+
+// TestBBRv3AckEpochAckedThresholdScaling verifies that the ack_epoch_acked
+// threshold is scaled by MTU (maxDatagramSize). Linux's BBR_ACK_EPOCH_ACKED_MAX
+// = (1<<20) - 1 is a 20-bit *packet* count. quic-go's ackEpochAcked is a byte
+// count, so applying the same constant as bytes causes epoch resets ~700x too
+// early on high-BDP paths (1500-byte MTU vs 1-byte packets).
+func TestBBRv3AckEpochAckedThresholdScaling(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set a known MTU
+	bbr.maxDatagramSize = 1500
+	bbr.fullBandwidthReached = true
+	// Use low bandwidth so expected bytes << actual acked bytes (triggers aggregation)
+	bbr.bwHi[0] = 100_000 // 100 KB/s
+
+	// The MTU-scaled threshold is (1<<20) * 1500 = 1,572,864,000 bytes (~1.5 GB)
+	// The old unscaled threshold was (1<<20) = 1,048,576 bytes (~1 MB)
+	//
+	// We'll accumulate 2 MiB (past the old threshold) and verify no reset occurred.
+	// To avoid "ackEpochAcked <= expected" resets, we use low bandwidth so
+	// acked bytes accumulate faster than the expected BDP.
+
+	totalAcked := protocol.ByteCount(0)
+	for i := 0; i < 2000; i++ {
+		rs := bbrRateSample{newlyAcked: 1200}
+		// Use short intervals so expected stays small relative to acked
+		bbr.updateAckAggregation(rs, now.Add(time.Duration(i)*time.Millisecond))
+		totalAcked += 1200
+	}
+
+	// Total acked = 2000 * 1200 = 2,400,000 bytes (~2.4 MB)
+	// This is well past the old 1 MB threshold but below the new ~1.5 GB threshold.
+	// With the fix, ackEpochAcked should accumulate past 1 MB without reset.
+	require.Greater(t, bbr.ackEpochAcked, protocol.ByteCount(1<<20),
+		"ack_epoch_acked should not reset at 1MB with MTU-scaled threshold")
+}
+
+// TestBBRv3AckEpochUnderflowGuard verifies that updateAckAggregation handles
+// edge cases gracefully, including zero maxDatagramSize (which shouldn't happen
+// but we should be defensive).
+func TestBBRv3AckEpochUnderflowGuard(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Edge case: maxDatagramSize is 0 (shouldn't happen but be defensive)
+	bbr.maxDatagramSize = 0
+
+	// Should not panic
+	rs := bbrRateSample{newlyAcked: 1000}
+	require.NotPanics(t, func() {
+		bbr.updateAckAggregation(rs, now)
+	}, "should handle zero maxDatagramSize gracefully")
+}
