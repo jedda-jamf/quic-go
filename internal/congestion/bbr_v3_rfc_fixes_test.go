@@ -278,6 +278,78 @@ func TestBBRv3NonCollidedPacketsUnaffected(t *testing.T) {
 }
 
 // =============================================================================
+// M1a: ECN GUARD AT ZERO minRTT TESTS
+// =============================================================================
+
+// TestBBRv3ECNGuardAtZeroMinRTT verifies that ECN feedback is not processed
+// before minRTT is established. When minRTT == 0 (no RTT sample yet), ECN
+// counters can arrive before QUIC validation completes. The guard ensures
+// ecnEligible remains false and pendingECNCEBytes is not stored until we
+// have a real minRTT measurement.
+func TestBBRv3ECNGuardAtZeroMinRTT(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// minRTT is zero (no RTT sample yet)
+	require.Equal(t, time.Duration(0), bbr.minRTT)
+
+	// Receive ECN feedback before minRTT is established
+	bbr.OnECNFeedback(1000, 100, 0, 10, 0, now)
+
+	// ecnEligible should still be false — can't trust ECN before minRTT
+	require.False(t, bbr.ecnEligible,
+		"ECN should not be eligible before minRTT is established")
+
+	// pendingECNCEBytes should NOT be stored
+	require.Equal(t, protocol.ByteCount(0), bbr.pendingECNCEBytes,
+		"CE bytes should not be stored before ECN eligibility")
+}
+
+// TestBBRv3ECNEligibilityTransition verifies the correct transition from
+// ECN-ineligible (minRTT == 0) to ECN-eligible (minRTT > 0 and within
+// ECN_MAX_RTT threshold). The first ECN feedback before minRTT is ignored,
+// but subsequent feedback after minRTT is established should be processed.
+func TestBBRv3ECNEligibilityTransition(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Phase 1: ECN feedback before minRTT
+	bbr.OnECNFeedback(1000, 100, 0, 10, 0, now)
+	require.False(t, bbr.ecnEligible)
+	require.Equal(t, protocol.ByteCount(0), bbr.pendingECNCEBytes)
+
+	// Establish minRTT
+	bbr.minRTT = 3 * time.Millisecond // Within ECN_MAX_RTT (5ms)
+
+	// Phase 2: ECN feedback after minRTT — should be eligible now
+	bbr.OnECNFeedback(1000, 200, 0, 20, 0, now.Add(time.Millisecond))
+	require.True(t, bbr.ecnEligible,
+		"ECN should become eligible after minRTT is established")
+	require.Greater(t, bbr.pendingECNCEBytes, protocol.ByteCount(0),
+		"CE bytes should be stored after eligibility")
+}
+
+// TestBBRv3ECNGuardHighMinRTT verifies that ECN feedback is rejected when
+// minRTT exceeds ECN_MAX_RTT (5ms). Low-latency ECN signals are only
+// meaningful on paths with sub-5ms RTT per tcp_bbr.c:bbr_ecn_max_rtt_us.
+func TestBBRv3ECNGuardHighMinRTT(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set minRTT above ECN_MAX_RTT threshold
+	bbr.minRTT = 10 * time.Millisecond // Above ECN_MAX_RTT (5ms)
+
+	// Receive ECN feedback
+	bbr.OnECNFeedback(1000, 100, 0, 10, 0, now)
+
+	// ecnEligible should remain false - RTT too high for ECN
+	require.False(t, bbr.ecnEligible,
+		"ECN should not be eligible when minRTT > ECN_MAX_RTT")
+	require.Equal(t, protocol.ByteCount(0), bbr.pendingECNCEBytes,
+		"CE bytes should not be stored when minRTT > ECN_MAX_RTT")
+}
+
+// =============================================================================
 // H2: PER-EVENT RTT FOR updateMinRTT TESTS
 // =============================================================================
 
