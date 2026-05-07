@@ -555,7 +555,7 @@ func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount
 	// Note: We intentionally do NOT initialize minRTT from rttStats.MinRTT() here.
 	// The RTT stats may have a default value (e.g., 100ms) that isn't a real measurement.
 	// BBR's minRTT should only be set from actual RTT samples in updateMinRTT().
-	bbr.pacer = newPacer(bbr.BandwidthEstimate)
+	bbr.pacer = newPacer(bbr.bandwidthEstimateForPacer)
 	bbr.initPacingRate()
 
 	if bbr.qlogger != nil {
@@ -804,12 +804,34 @@ func (bbr *BBRv3) GetCongestionWindow() protocol.ByteCount {
 	return bbr.congestionWindow
 }
 
-// BandwidthEstimate returns the current bandwidth estimate.
+// BandwidthEstimate returns the current pacing rate (gain-adjusted, with 1%
+// margin applied per §5.6.2). This is the logical rate BBR uses for control
+// decisions. The actual pacer may apply additional multipliers — see
+// bandwidthEstimateForPacer() for the rate passed to the shared pacer.
 func (bbr *BBRv3) BandwidthEstimate() Bandwidth {
 	if bbr.pacingRate > 0 {
 		return Bandwidth(bbr.pacingRate) * BytesPerSecond
 	}
 	return Bandwidth(max(bbr.nominalBandwidth(), 1)) * BytesPerSecond
+}
+
+// bandwidthEstimateForPacer returns the rate the shared pacer should schedule at.
+// The shared pacer applies a Reno-era 5/4 multiplier to compensate for RTT
+// variation in controllers that don't compute a dynamic pacing gain. BBRv3
+// already encodes pacing_gain and the 1% margin in bbr.pacingRate per
+// draft-ietf-ccwg-bbr-05 §5.6.2, so we pre-divide by 5/4 here to neutralize
+// the pacer's multiplier.
+// This method exists only because the pacer applies a Reno-era 5/4 multiplier;
+// remove when newPacer accepts a multiplier parameter.
+func (bbr *BBRv3) bandwidthEstimateForPacer() Bandwidth {
+	rate := bbr.pacingRate
+	if rate <= 0 {
+		rate = max(bbr.nominalBandwidth(), 1)
+	}
+	// Note: rate * 4 / 5 (multiply-then-divide) preserves integer precision for
+	// byte-count math. Do not reorder to rate / 5 * 4.
+	rate = rate * 4 / 5
+	return Bandwidth(max(rate, 1)) * BytesPerSecond
 }
 
 // OnAckEventEnd flushes the ACK-event coalescing bucket for the current ACK frame.
