@@ -590,3 +590,23 @@ func TestBBRv3AckEpochUnderflowGuard(t *testing.T) {
 		bbr.updateAckAggregation(rs, now)
 	}, "should handle zero maxDatagramSize gracefully")
 }
+
+func TestBBRv3OnRetransmissionTimeoutNoOp(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Record initial state
+	initialCwnd := bbr.congestionWindow
+	initialPriorCwnd := bbr.priorCwnd
+	initialPTORecovery := bbr.ptoRecovery
+
+	// Call OnRetransmissionTimeout — should be a no-op
+	bbr.OnRetransmissionTimeout(true)
+
+	// Verify nothing changed
+	require.Equal(t, initialCwnd, bbr.congestionWindow,
+		"cwnd should not change on OnRetransmissionTimeout")
+	require.Equal(t, initialPriorCwnd, bbr.priorCwnd,
+		"priorCwnd should not change on OnRetransmissionTimeout")
+	require.Equal(t, initialPTORecovery, bbr.ptoRecovery,
+		"ptoRecovery should not change on OnRetransmissionTimeout")
+}
