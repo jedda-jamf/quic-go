@@ -416,9 +416,14 @@ type BBRv3 struct {
 	prevProbeTooHigh  bool
 	stoppedRiskyProbe bool
 	bwProbeSamples    bool
-	bwProbeUpRounds   uint8
-	bwProbeUpCnt      protocol.ByteCount
-	bwProbeUpAcks     protocol.ByteCount
+	bwProbeUpRounds uint8
+	// bwProbeUpCnt controls the rate at which ProbeBW_UP raises inflight_hi.
+	// Sentinels:
+	//   0                     — uninitialized; first ACK in UP triggers raiseInflightHiSlope.
+	//   protocol.MaxByteCount — upward probing disabled (set on Down/Refill entry).
+	//   any other value       — acked bytes per +1 packet of inflight_hi growth.
+	bwProbeUpCnt  protocol.ByteCount
+	bwProbeUpAcks protocol.ByteCount
 
 	ackEpochStart     monotime.Time
 	ackEpochAcked     protocol.ByteCount
