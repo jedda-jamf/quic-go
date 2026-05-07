@@ -1913,6 +1913,12 @@ func (bbr *BBRv3) maxInflight() protocol.ByteCount {
 	return bbr.quantizationBudget(inflight)
 }
 
+// probeRTTCwnd implements draft-ietf-ccwg-bbr-05 §5.6.4.5 BBRProbeRTTCwnd():
+//   probe_rtt_cwnd = BBRBDPMultiple(BBR.bw, BBR.ProbeRTTCwndGain)
+// where BBR.bw = min(BBR.max_bw, BBR.bw_shortterm) per §5.5.10. We use
+// boundedBandwidth() (= BBR.bw) here per the draft, NOT maxBandwidth()
+// (= BBR.max_bw). Linux tcp_bbr.c uses bbr_max_bw at this site as a
+// deliberate divergence from the IETF text; quic-go follows the draft.
 func (bbr *BBRv3) probeRTTCwnd() protocol.ByteCount {
 	return max(bbr.inflightFromBWGain(bbr.boundedBandwidth(), PROBE_RTT_CWND_GAIN), bbr.minPipeCwnd)
 }
