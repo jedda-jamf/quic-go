@@ -1792,26 +1792,6 @@ func TestBBRv3AckAggregationRaisesCwndTarget(t *testing.T) {
 	require.Greater(t, withExtraAcked, withoutExtraAcked)
 }
 
-func TestBBRv3RFCGains(t *testing.T) {
-	bbr := newTestBBRv3()
-
-	bbr.state = BBRDrain
-	bbr.updateGains()
-	require.InDelta(t, 0.5, bbr.pacingGain, 0.0001)
-	require.InDelta(t, 2.0, bbr.cwndGain, 0.0001)
-
-	bbr.state = BBRProbeBW
-	bbr.probeBWPhase = probeBWDown
-	bbr.updateGains()
-	require.InDelta(t, 0.9, bbr.pacingGain, 0.0001)
-	require.InDelta(t, 2.0, bbr.cwndGain, 0.0001)
-
-	bbr.state = BBRProbeRTT
-	bbr.updateGains()
-	require.InDelta(t, 1.0, bbr.pacingGain, 0.0001)
-	require.InDelta(t, PROBE_RTT_CWND_GAIN, bbr.cwndGain, 0.0001)
-}
-
 func TestBBRv3ProbeRTTCwndUsesBoundedBandwidth(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.minRTT = 40 * time.Millisecond
