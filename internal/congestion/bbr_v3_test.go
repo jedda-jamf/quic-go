@@ -368,9 +368,11 @@ func TestBBRv3IdleRestartPacingReset(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
 
-	// Establish steady state in ProbeBW with known pacing rate
+	// Establish steady state in ProbeBW with known bandwidth and pacing rate
 	setupProbeBWPhase(bbr, probeBWCruise)
-	bbr.pacingRate = 2_000_000 // 2 MB/s
+	// setupProbeBWPhase sets bwHi[0] = 10_000_000
+	// Set pacing rate to something different from expected reset value
+	bbr.pacingRate = 2_000_000 // 2 MB/s (different from bw-based rate)
 	bbr.pacingGain = 1.0
 
 	// Record initial pacing rate
@@ -386,12 +388,14 @@ func TestBBRv3IdleRestartPacingReset(t *testing.T) {
 	require.True(t, bbr.idleRestart,
 		"RFC §5.4: idleRestart flag MUST be set when sending from idle (priorInFlight == 0)")
 
-	// Pacing rate may be reset based on current bw estimate
-	// At minimum, verify the idle restart was detected
-	require.NotEqual(t, protocol.ByteCount(0), bbr.pacingRate,
-		"RFC §5.4: pacing rate MUST be positive after idle restart")
-
-	_ = initialPacingRate // Used for documentation
+	// RFC §5.4: Pacing rate MUST be reset to maxBandwidth() * gain * margin
+	// With bwHi[0] = 10_000_000, gain = 1.0, BBR_PACING_MARGIN = 0.99:
+	// expectedRate = 10_000_000 * 1.0 * 0.99 = 9_900_000
+	expectedPacingRate := protocol.ByteCount(float64(bbr.bwHi[0]) * 1.0 * 0.99)
+	require.NotEqual(t, initialPacingRate, bbr.pacingRate,
+		"RFC §5.4: pacing rate MUST change on idle restart (was %d)", initialPacingRate)
+	require.Equal(t, expectedPacingRate, bbr.pacingRate,
+		"RFC §5.4: pacing rate MUST be reset to maxBandwidth * gain * margin on idle restart")
 }
 
 // TestBBRv3IdleRestartPreservesCwnd verifies that cwnd is not reduced
