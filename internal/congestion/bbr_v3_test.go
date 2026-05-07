@@ -216,6 +216,44 @@ func TestBBRv3GuardrailAckAdvancesFirstSendTime(t *testing.T) {
 		"send_elapsed for later packets should use the refreshed firstSentTime")
 }
 
+func TestBBRv3GuardrailNewestPacketTieBreakUsesPacketNumber(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Send two packets at the exact same send time so RFC §4.1.2.3 requires
+	// using packet_id to decide which delivered packet is "newest".
+	bbr.OnPacketSent(now, 1200, 1, 1200, true)
+	bbr.OnPacketSent(now, 2400, 2, 1200, true)
+
+	// Force distinct per-packet sampler snapshots so we can see which one wins.
+	st1 := bbr.sentPackets[1]
+	st1.delivered = 111
+	st1.deliveredTime = now.Add(-20 * time.Millisecond)
+	st1.firstSentTime = now.Add(-30 * time.Millisecond)
+	st1.isAppLimited = true
+	bbr.sentPackets[1] = st1
+
+	st2 := bbr.sentPackets[2]
+	st2.delivered = 222
+	st2.deliveredTime = now.Add(-10 * time.Millisecond)
+	st2.firstSentTime = now.Add(-15 * time.Millisecond)
+	st2.isAppLimited = false
+	bbr.sentPackets[2] = st2
+
+	ackTime := now.Add(40 * time.Millisecond)
+	bbr.OnPacketAcked(1, 1200, 2400, ackTime)
+	bbr.OnPacketAcked(2, 1200, 1200, ackTime)
+
+	require.Equal(t, uint64(222), bbr.pendingPriorDelivered,
+		"ACK-event sample should use the highest packet number when send times tie")
+	require.Equal(t, now.Add(-10*time.Millisecond), bbr.pendingPriorTime,
+		"ACK-event sample should use the newest delivered packet's delivered_time")
+	require.Equal(t, 15*time.Millisecond, bbr.pendingSendElapsed,
+		"ACK-event sample should use the newest delivered packet's send_elapsed")
+	require.False(t, bbr.pendingIsAppLimited,
+		"RS.is_app_limited should come from the newest delivered packet when send times tie")
+}
+
 func TestBBRv3DrainCompletionAndProbeBWTransitions(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
