@@ -513,21 +513,61 @@ func TestBBRv3OffloadBudgetCalculation(t *testing.T) {
 		"offload_budget should equal send_quantum for QUIC")
 }
 
-// TestBBRv3QuantizationBudgetFloors verifies quantizationBudget returns
-// max of inflight, offload_budget, minPipeCwnd per RFC §5.6.4.2.
-func TestBBRv3QuantizationBudgetFloors(t *testing.T) {
-	bbr := newTestBBRv3()
+// TestBBRv3QuantizationBudgetBindingTerms verifies that quantizationBudget
+// correctly returns max(inflight, offload_budget, minPipeCwnd) per RFC §5.6.4.2.
+// AGENTIC GUARDRAIL: RFC §5.6.4.2 REQUIRES each term can be the binding maximum.
+func TestBBRv3QuantizationBudgetBindingTerms(t *testing.T) {
+	tests := []struct {
+		name          string
+		inflight      protocol.ByteCount
+		pacingRate    protocol.ByteCount // affects sendQuantum -> offload_budget
+		expectedFloor string             // which term should win
+	}{
+		{
+			name:          "large inflight wins",
+			inflight:      100_000,
+			pacingRate:    1_000_000, // sendQuantum ~1000, offload_budget ~1000
+			expectedFloor: "inflight",
+		},
+		{
+			name:          "large offload_budget wins",
+			inflight:      1_000,
+			pacingRate:    100_000_000, // sendQuantum = 64KB (capped), offload_budget = 64KB
+			expectedFloor: "offload_budget",
+		},
+		{
+			name:          "minPipeCwnd wins",
+			inflight:      1_000,
+			pacingRate:    10_000, // sendQuantum ~10, offload_budget ~10
+			expectedFloor: "minPipeCwnd",
+		},
+	}
 
-	// Low pacing rate to make floors visible
-	bbr.pacingRate = 1_000 // 1 KB/s -> sendQuantum very small
-	bbr.setSendQuantum()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bbr := newTestBBRv3()
+			bbr.pacingRate = tc.pacingRate
+			bbr.setSendQuantum()
 
-	// Test with tiny inflight value
-	floor := bbr.quantizationBudget(100)
+			result := bbr.quantizationBudget(tc.inflight)
 
-	// Should be at least minPipeCwnd (4 * MSS = 4 * 1280 = 5120)
-	require.GreaterOrEqual(t, floor, bbr.minPipeCwnd,
-		"quantization floor should be at least minPipeCwnd")
+			switch tc.expectedFloor {
+			case "inflight":
+				require.Equal(t, tc.inflight, result,
+					"RFC §5.6.4.2: inflight MUST be returned when it is the maximum")
+			case "offload_budget":
+				require.Equal(t, bbr.offloadBudget, result,
+					"RFC §5.6.4.2: offload_budget MUST be returned when it is the maximum")
+			case "minPipeCwnd":
+				require.Equal(t, bbr.minPipeCwnd, result,
+					"RFC §5.6.4.2: minPipeCwnd MUST be returned when it is the maximum")
+			}
+
+			// All results must be at least minPipeCwnd
+			require.GreaterOrEqual(t, result, bbr.minPipeCwnd,
+				"RFC §5.6.4.2: result MUST be at least minPipeCwnd")
+		})
+	}
 }
 
 // TestBBRv3CwndQuantizationFloor verifies cwnd respects quantization floor
