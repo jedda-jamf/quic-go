@@ -65,3 +65,107 @@ func TestBBRv3ShortIntervalSamplesKeepLatestDeliveryBookkeeping(t *testing.T) {
 	require.True(t, bbr.lossRoundStart)
 	require.Equal(t, uint64(42_000), bbr.lossRoundDelivered)
 }
+
+func TestBBRv3PacerMultiplierCompensation(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up a known pacing rate
+	bbr.pacingRate = 1_000_000 // 1 MB/s
+
+	// The helper should return 4/5 of the pacing rate to neutralize pacer's 5/4 multiplier
+	compensated := bbr.bandwidthEstimateForPacer()
+
+	// 1_000_000 * 4/5 = 800_000 bytes/s
+	// bandwidthEstimateForPacer returns Bandwidth (bytes/s * BytesPerSecond)
+	expected := Bandwidth(800_000) * BytesPerSecond
+	require.Equal(t, expected, compensated, "should pre-divide by 5/4 to neutralize pacer multiplier")
+}
+
+func TestBBRv3PacerHelperEquality(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Normal path: pacingRate is set
+	bbr.pacingRate = 1_000_000
+	compensated := bbr.bandwidthEstimateForPacer()
+	original := bbr.BandwidthEstimate()
+
+	// compensated * 5/4 should approximately equal original
+	// (within 1 byte/s for integer rounding)
+	reconstructed := Bandwidth(uint64(compensated) * 5 / 4)
+	diff := int64(original) - int64(reconstructed)
+	if diff < 0 {
+		diff = -diff
+	}
+	require.LessOrEqual(t, diff, int64(BytesPerSecond), "compensated * 5/4 should ≈ BandwidthEstimate()")
+}
+
+func TestBBRv3PacerFallbackCompensation(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Fallback path: pacingRate is zero, should use nominalBandwidth
+	bbr.pacingRate = 0
+	bbr.congestionWindow = 100_000
+	// With 100ms default RTT: nominal = 100_000 / 0.1s = 1_000_000 bytes/s
+
+	compensated := bbr.bandwidthEstimateForPacer()
+
+	// Fallback should ALSO apply 4/5 compensation
+	// nominal * 4/5 = 1_000_000 * 4/5 = 800_000
+	expected := Bandwidth(800_000) * BytesPerSecond
+	require.Equal(t, expected, compensated, "fallback path should also apply 4/5 compensation")
+}
+
+func TestBBRv3PacerLowRateEdgeCase(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Low rate edge case: rate=7 bytes/s
+	// 7 * 4 / 5 = 28 / 5 = 5 (integer division)
+	bbr.pacingRate = 7
+
+	compensated := bbr.bandwidthEstimateForPacer()
+
+	// Should be at least 1 (the max(rate, 1) guard)
+	require.GreaterOrEqual(t, uint64(compensated), uint64(BytesPerSecond),
+		"low rate should still produce valid bandwidth")
+
+	// Verify the exact calculation: 7 * 4 / 5 = 5
+	expected := Bandwidth(5) * BytesPerSecond
+	require.Equal(t, expected, compensated)
+}
+
+func TestBBRv3FullChainPacingEquivalence(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set a known pacing rate: 1 MB/s
+	bbr.pacingRate = 1_000_000
+
+	// Verify the helper returns the compensated value
+	compensated := bbr.bandwidthEstimateForPacer()
+	require.Equal(t, Bandwidth(800_000)*BytesPerSecond, compensated,
+		"helper should return 4/5 of pacing rate")
+
+	// Verify BandwidthEstimate returns the full pacing rate
+	full := bbr.BandwidthEstimate()
+	require.Equal(t, Bandwidth(1_000_000)*BytesPerSecond, full,
+		"BandwidthEstimate should return full pacing rate")
+
+	// The effective pacing rate after pacer's 5/4 multiplier:
+	// 800,000 * 5/4 = 1,000,000 bytes/s (matches bbr.pacingRate)
+	// This confirms the compensation neutralizes the pacer multiplier.
+
+	// Send enough packets to exhaust burst budget and verify pacing kicks in
+	// First, drain the initial burst budget by sending packets
+	for i := 0; i < 20; i++ {
+		bbr.OnPacketSent(now, 0, protocol.PacketNumber(i+1), 1500, true)
+	}
+
+	// Now the pacer should have no budget left
+	require.False(t, bbr.HasPacingBudget(now),
+		"pacer budget should be exhausted after burst")
+
+	// After some time, budget should replenish at the compensated rate
+	// At 1MB/s effective rate: 1.5ms for one 1500-byte packet
+	require.True(t, bbr.HasPacingBudget(now.Add(2*time.Millisecond)),
+		"pacer should have budget after waiting for packet time")
+}
