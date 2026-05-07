@@ -756,6 +756,73 @@ func TestBBRv3ECNAlphaReducesInflightLo(t *testing.T) {
 		"inflightLo should be reduced by ecnAlpha * ECN_FACTOR")
 }
 
+// TestBBRv3ECNEventPath verifies that ECN feedback flows through the
+// production event path: OnECNFeedback → OnPacketAcked → OnAckEventEnd.
+// IMPLEMENTATION: Verifies tcp_bbr.c-style ECN integration works end-to-end.
+func TestBBRv3ECNEventPath(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Establish steady state with ECN eligible
+	setupProbeBWPhase(bbr, probeBWCruise)
+	bbr.minRTT = 3 * time.Millisecond // Enable ECN eligibility (must be <= ECN_MAX_RTT=5ms)
+	bbr.ecnEligible = true
+	bbr.ecnAlpha = 0.0
+	bbr.inflightLo = 100_000
+
+	// Set up round boundary so round_start will be triggered in updateRoundStart
+	// Packets capture C.delivered at send time; round starts when priorDelivered >= nextRoundDelivered
+	bbr.totalBytesAcked = 10_000
+	bbr.nextRoundDelivered = 5_000
+
+	// Set lossRoundDelivered high so lossRoundStart stays false in updateLatestDeliverySignals
+	// This prevents ecnInRound from being reset after it's set in updateCongestionSignals
+	bbr.lossRoundDelivered = 100_000
+
+	// Record baseline
+	initialTotalCE := bbr.totalBytesAckedCE
+
+	// Send packets - they capture totalBytesAcked (10000) as their delivered field
+	for i := 1; i <= 5; i++ {
+		bbr.OnPacketSent(now, protocol.ByteCount(i*1200), protocol.PacketNumber(i), 1200, true)
+	}
+
+	// Provide ECN feedback through production path
+	// Simulate 60% CE marking: 3 CE marks out of 5 ECN-capable packets
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnECNFeedback(
+		5*1200,  // ackedBytes
+		2,       // ect0Total (2 packets without CE)
+		0,       // ect1Total
+		3,       // ceTotal (3 packets with CE)
+		0,       // priorInFlight
+		ackTime,
+	)
+
+	// ACK the packets
+	for i := 1; i <= 5; i++ {
+		bbr.OnPacketAcked(protocol.PacketNumber(i), 1200, 0, ackTime)
+	}
+
+	// Process the ACK event - this triggers the full model update pipeline
+	bbr.OnAckEventEnd(ackTime)
+
+	// Verify ECN was processed through the event path:
+	// 1. totalBytesAckedCE should increase (processPendingAckEvent line 1029)
+	require.Greater(t, bbr.totalBytesAckedCE, initialTotalCE,
+		"totalBytesAckedCE MUST increase when CE bytes delivered through event path")
+
+	// 2. ecnInRound should be set (updateCongestionSignals line 1216)
+	require.True(t, bbr.ecnInRound,
+		"ecnInRound MUST be set when CE bytes delivered through event path")
+
+	// 3. ecnAlpha should have moved from 0 toward the CE ratio
+	// With 60% CE (3/5), after one EWMA update with g=1/16:
+	// alpha = (15/16)*0 + (1/16)*0.6 = 0.0375
+	require.Greater(t, bbr.ecnAlpha, 0.0,
+		"ecnAlpha MUST increase when CE marks received through event path")
+}
+
 // TestBBRv3ProbeBWCruiseLossReducesBounds verifies loss in CRUISE reduces
 // bwLo and inflightLo by Beta (30%) per RFC §5.5.10.1.
 func TestBBRv3ProbeBWCruiseLossReducesBounds(t *testing.T) {
