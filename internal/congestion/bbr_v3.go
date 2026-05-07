@@ -939,9 +939,14 @@ func (bbr *BBRv3) OnECNFeedback(
 	if total <= 0 {
 		return
 	}
-	if total > 0 && (bbr.minRTT <= ECN_MAX_RTT || ECN_MAX_RTT == 0) {
-		bbr.ecnEligible = true
+
+	// Surgical guard: do not feed ECN into the BBR model until minRTT is real
+	// AND within the low-RTT eligibility envelope.
+	// Per M1a: minRTT == 0 means no RTT sample yet, so we cannot trust ECN feedback.
+	if bbr.minRTT <= 0 || (ECN_MAX_RTT != 0 && bbr.minRTT > ECN_MAX_RTT) {
+		return // Don't store pendingECNCEBytes before eligibility
 	}
+	bbr.ecnEligible = true
 
 	ceBytes := protocol.ByteCount(uint64(ackedBytes) * uint64(ceDelta) / uint64(max(total, int64(1))))
 	bbr.pendingECNEventValid = true
