@@ -188,3 +188,89 @@ func TestBBRv3InitialPacingRateGuardrail(t *testing.T) {
 	require.Greater(t, bbr.pacingRate, protocol.ByteCount(500_000),
 		"initial pacing rate should be reasonable for 100ms RTT")
 }
+
+// =============================================================================
+// H1a: PN-SPACE COLLISION DETECTION TESTS
+// =============================================================================
+
+// TestBBRv3CollisionDetectionOnSend verifies that when a second packet is sent
+// with the same raw packet number (PN-space collision during handshake), the
+// collision is detected, the PN is marked in collisionPNs, and the original
+// entry is removed from sentPackets.
+func TestBBRv3CollisionDetectionOnSend(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Send Initial[0] - stored at key 0
+	bbr.OnPacketSent(now, 0, 0, 1200, true)
+	require.Contains(t, bbr.sentPackets, protocol.PacketNumber(0))
+
+	// Send Handshake[0] - COLLISION: same raw PN, different space
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1200, 0, 1200, true)
+
+	// Collision should be detected and recorded
+	require.NotNil(t, bbr.collisionPNs)
+	require.Contains(t, bbr.collisionPNs, protocol.PacketNumber(0))
+	// The sentPackets entry should be removed to prevent corrupt state
+	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(0))
+}
+
+// TestBBRv3SubsequentSendsToCollidedPN verifies that once a PN has collided,
+// all subsequent packets with that PN (from any space) are silently ignored.
+func TestBBRv3SubsequentSendsToCollidedPN(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Trigger collision on PN 0
+	bbr.OnPacketSent(now, 0, 0, 1200, true)
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1200, 0, 1200, true)
+
+	// Now send 1-RTT[0] - should be silently ignored
+	bbr.OnPacketSent(now.Add(2*time.Millisecond), 2400, 0, 1200, true)
+	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(0))
+}
+
+// TestBBRv3LossOnCollidedPNSkipsLossModel verifies that loss events for
+// collided PNs do not corrupt the loss model (totalBytesLost, etc).
+func TestBBRv3LossOnCollidedPNSkipsLossModel(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Trigger collision on PN 0
+	bbr.OnPacketSent(now, 0, 0, 1200, true)
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1200, 0, 1200, true)
+
+	// Record initial loss state
+	initialLost := bbr.totalBytesLost
+
+	// Report loss for collided PN - should be skipped
+	bbr.OnCongestionEvent(0, 1200, 0)
+
+	// Loss model should NOT be updated
+	require.Equal(t, initialLost, bbr.totalBytesLost)
+}
+
+// TestBBRv3NonCollidedPacketsUnaffected verifies that packets with non-collided
+// PNs continue to work normally for both send tracking and ACK processing.
+func TestBBRv3NonCollidedPacketsUnaffected(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Trigger collision on PN 0
+	bbr.OnPacketSent(now, 0, 0, 1200, true)
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1200, 0, 1200, true)
+
+	// Send a normal packet with PN 1 - should work normally
+	bbr.OnPacketSent(now.Add(2*time.Millisecond), 2400, 1, 1200, true)
+	require.Contains(t, bbr.sentPackets, protocol.PacketNumber(1))
+
+	// ACK the non-collided packet
+	initialAcked := bbr.totalBytesAcked
+	bbr.OnPacketAcked(1, 1200, 3600, now.Add(50*time.Millisecond))
+	bbr.OnAckEventEnd(now.Add(50 * time.Millisecond))
+
+	// totalBytesAcked should be updated
+	require.Greater(t, bbr.totalBytesAcked, initialAcked)
+	// Packet should be removed from tracking after ACK
+	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(1))
+}
