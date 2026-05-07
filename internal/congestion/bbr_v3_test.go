@@ -13,6 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// ============================================================================
+// TEST FIXTURES AND HELPERS
+// ============================================================================
+
 func newTestBBRv3() *BBRv3 {
 	return NewBBRV3(DefaultClock{}, utils.NewRTTStats(), nil, initialMaxDatagramSize, false, nil)
 }
@@ -215,9 +219,9 @@ func TestBBRv3IdleRestartFlagLifecycle(t *testing.T) {
 		"idleRestart should be cleared after first ACK")
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // §5.5.8 and §5.6.3: SEND QUANTUM AND OFFLOAD BUDGET
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 // TestBBRv3SendQuantumCalculation verifies send_quantum = min(pacing_rate * 1ms, 64KB)
 // with a floor of 2*MSS per RFC §5.6.3.
@@ -311,9 +315,9 @@ func TestBBRv3CwndQuantizationFloor(t *testing.T) {
 		"cwnd target should respect minPipeCwnd floor")
 }
 
-// ============================================================================
-// RFC §5.3.3.6.4: ECN ALPHA CALCULATION
-// ============================================================================
+// ----------------------------------------------------------------------------
+// §5.3.3.6.4: ECN ALPHA CALCULATION
+// ----------------------------------------------------------------------------
 
 // TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha
 // per RFC §5.3.3.6.4: alpha = (1-g)*alpha + g*(CE/acked), g=1/16.
@@ -540,6 +544,10 @@ func TestBBRv3LowerBoundsConstrainCwnd(t *testing.T) {
 		"cwnd should be bounded by inflightLo")
 }
 
+// ============================================================================
+// §5.6: CONTROL PARAMETERS (Gains, Pacing, Cwnd)
+// ============================================================================
+
 // TestBBRv3GainTableRFCCompliance verifies all state/phase gain values
 // match RFC draft-ietf-ccwg-bbr-05 §5.6.1.
 func TestBBRv3GainTableRFCCompliance(t *testing.T) {
@@ -637,6 +645,10 @@ func TestBBRv3PacingBudget(t *testing.T) {
 	require.False(t, bbr.HasPacingBudget(now))
 	require.True(t, bbr.HasPacingBudget(now.Add(200*time.Millisecond)))
 }
+
+// ============================================================================
+// §5.3.1: STARTUP
+// ============================================================================
 
 func TestBBRv3InitialQlogTelemetry(t *testing.T) {
 	rec := &recordingQlogger{}
@@ -853,6 +865,10 @@ func TestBBRv3GuardrailNewestPacketTieBreakUsesPacketNumber(t *testing.T) {
 		"RS.is_app_limited should come from the newest delivered packet when send times tie")
 }
 
+// ============================================================================
+// §5.3.2: DRAIN
+// ============================================================================
+
 func TestBBRv3DrainCompletionAndProbeBWTransitions(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -912,6 +928,10 @@ func TestBBRv3DrainFallbackUsesDrainStartRound(t *testing.T) {
 	require.Equal(t, BBRProbeBW, bbr.state)
 }
 
+// ============================================================================
+// §5.3.3: PROBEBW
+// ============================================================================
+
 func TestBBRv3ProbeTimingWallClockAndRenoRoundTrigger(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -964,6 +984,10 @@ func TestBBRv3UpperAndLowerBoundAdaptation(t *testing.T) {
 	require.Equal(t, protocol.ByteCount(24_000), bbr.inflightLo)
 }
 
+// ============================================================================
+// §5.3.4: PROBERTT
+// ============================================================================
+
 func TestBBRv3ProbeRTTEnterExitAndIdleRestartSuppression(t *testing.T) {
 	rttStats := utils.NewRTTStats()
 	rttStats.UpdateRTT(25*time.Millisecond, 0)
@@ -1008,6 +1032,10 @@ func TestBBRv3ProbeRTTEnterExitAndIdleRestartSuppression(t *testing.T) {
 	idleRestart.updateMinRTT(now)
 	require.NotEqual(t, BBRProbeRTT, idleRestart.state)
 }
+
+// ============================================================================
+// §5.5: MODEL UPDATES (AckAggregation, ECN, Loss Bounds)
+// ============================================================================
 
 func TestBBRv3AckAggregationRaisesCwndTarget(t *testing.T) {
 	bbr := newTestBBRv3()
