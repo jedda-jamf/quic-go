@@ -252,6 +252,72 @@ func TestBBRv3LossOnCollidedPNSkipsLossModel(t *testing.T) {
 	require.Equal(t, initialLost, bbr.totalBytesLost)
 }
 
+// TestBBRv3ACKOnCollidedPNLeavesModelUntouched verifies that ACKing a collided
+// PN does not update any sampler or model state: totalBytesAcked, pendingAckedBytes,
+// bwLatest, bwHi, max_bw filter, or ECN state must all remain unchanged.
+func TestBBRv3ACKOnCollidedPNLeavesModelUntouched(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Establish baseline state with a real packet flow first
+	bbr.OnPacketSent(now, 0, 5, 1200, true)
+	bbr.OnPacketAcked(5, 1200, 0, now.Add(10*time.Millisecond))
+	bbr.OnAckEventEnd(now.Add(10 * time.Millisecond))
+
+	// Set up minRTT for ECN eligibility
+	bbr.minRTT = 10 * time.Millisecond
+
+	// Trigger collision on PN 0
+	bbr.OnPacketSent(now.Add(20*time.Millisecond), 0, 0, 1200, true)
+	bbr.OnPacketSent(now.Add(21*time.Millisecond), 1200, 0, 1200, true)
+	require.Contains(t, bbr.collisionPNs, protocol.PacketNumber(0))
+
+	// Snapshot all model state before ACK
+	snapshotAcked := bbr.totalBytesAcked
+	snapshotPendingAcked := bbr.pendingAckedBytes
+	snapshotBwLatest := bbr.bwLatest
+	snapshotBwHi := bbr.bwHi
+	snapshotMaxBwSlot0 := bbr.bwHi[0]
+	snapshotMaxBwSlot1 := bbr.bwHi[1]
+	snapshotPendingCE := bbr.pendingCEBytes
+
+	// Set up pending ECN for this event
+	ackTime := now.Add(50 * time.Millisecond)
+	bbr.OnECNFeedback(2000, 200, 0, 20, 0, ackTime)
+	snapshotECNValid := bbr.pendingECNEventValid
+	snapshotECNCEBytes := bbr.pendingECNCEBytes
+
+	// ACK the collided PN
+	bbr.OnPacketAcked(0, 1200, 1200, ackTime)
+
+	// All sampler state must remain unchanged
+	require.Equal(t, snapshotAcked, bbr.totalBytesAcked,
+		"totalBytesAcked should not change on collided ACK")
+	require.Equal(t, snapshotPendingAcked, bbr.pendingAckedBytes,
+		"pendingAckedBytes should not change on collided ACK")
+	require.Equal(t, snapshotBwLatest, bbr.bwLatest,
+		"bwLatest should not change on collided ACK")
+	require.Equal(t, snapshotBwHi, bbr.bwHi,
+		"bwHi should not change on collided ACK")
+	require.Equal(t, snapshotMaxBwSlot0, bbr.bwHi[0],
+		"max_bw filter slot 0 should not change on collided ACK")
+	require.Equal(t, snapshotMaxBwSlot1, bbr.bwHi[1],
+		"max_bw filter slot 1 should not change on collided ACK")
+	require.Equal(t, snapshotPendingCE, bbr.pendingCEBytes,
+		"pendingCEBytes should not change on collided ACK")
+
+	// ECN state should NOT be consumed by collided packet
+	require.Equal(t, snapshotECNValid, bbr.pendingECNEventValid,
+		"pendingECNEventValid should not change on collided ACK")
+	require.Equal(t, snapshotECNCEBytes, bbr.pendingECNCEBytes,
+		"pendingECNCEBytes should not be consumed on collided ACK")
+
+	// Event end should clear stale ECN since no real packet was processed
+	bbr.OnAckEventEnd(ackTime)
+	require.False(t, bbr.pendingECNEventValid,
+		"all-collided ACK event should clear stale ECN at end")
+}
+
 // TestBBRv3NonCollidedPacketsUnaffected verifies that packets with non-collided
 // PNs continue to work normally for both send tracking and ACK processing.
 func TestBBRv3NonCollidedPacketsUnaffected(t *testing.T) {
