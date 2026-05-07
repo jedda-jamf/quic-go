@@ -1978,12 +1978,18 @@ func (bbr *BBRv3) updateAckAggregation(rs bbrRateSample, now monotime.Time) {
 	if epoch > 0 {
 		expected = protocol.ByteCount(uint64(bbr.boundedBandwidth()) * uint64(epoch) / uint64(time.Second))
 	}
-	if bbr.ackEpochAcked <= expected || bbr.ackEpochAcked+rs.newlyAcked >= (1<<20) {
+	// Linux's BBR_ACK_EPOCH_ACKED_MAX = (1<<20) - 1 is a 20-bit *packet* count.
+	// quic-go's ackEpochAcked is a byte count, so we scale the threshold by
+	// maxDatagramSize to keep the time-equivalent guard the same as Linux.
+	resetThresh := protocol.ByteCount(1<<20) * bbr.maxDatagramSize
+	satCap := max(resetThresh-1, 0)
+
+	if bbr.ackEpochAcked <= expected || bbr.ackEpochAcked+rs.newlyAcked >= resetThresh {
 		bbr.ackEpochAcked = 0
 		bbr.ackEpochStart = now
 		expected = 0
 	}
-	bbr.ackEpochAcked = min(bbr.ackEpochAcked+rs.newlyAcked, protocol.ByteCount((1<<20)-1))
+	bbr.ackEpochAcked = min(bbr.ackEpochAcked+rs.newlyAcked, satCap)
 	extra := bbr.ackEpochAcked - expected
 	extra = min(extra, bbr.congestionWindow)
 	if extra > bbr.extraAcked[bbr.extraAckedWinIdx] {
