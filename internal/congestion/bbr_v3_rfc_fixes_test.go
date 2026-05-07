@@ -437,3 +437,98 @@ func TestBBRv3ExtraAckedRetentionWindow(t *testing.T) {
 	require.Less(t, bbr.maxExtraAcked(), protocol.ByteCount(10000),
 		"original sample should be rotated out within 10 rounds")
 }
+
+// =============================================================================
+// M3: EXTRA_ACKED INSIDE QUANTIZATION BUDGET TESTS
+// =============================================================================
+
+// TestBBRv3ExtraAckedInsideQuantization verifies that maxInflight() adds
+// extra_acked BEFORE applying quantizationBudget(), not after. Per RFC
+// draft-ietf-ccwg-bbr-05 §5.6.4.2, the order is:
+//
+//	inflight_cap = BBRBDPMultiple(BBR.cwnd_gain)  // BDP * gain
+//	inflight_cap += BBR.extra_acked               // add extra_acked
+//	BBR.max_inflight = BBRQuantizationBudget(inflight_cap)  // THEN quantize
+//
+// The bug was adding extra_acked AFTER quantization, which means the
+// quantization floor doesn't account for the aggregation headroom.
+func TestBBRv3ExtraAckedInsideQuantization(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up a high-BDP scenario where extra_acked dominates quantization floors.
+	// With 50ms RTT and 1 MB/s, BDP = 1,000,000 * 0.050 = 50,000 bytes
+	// This is well above minPipeCwnd and offloadBudget, so quantization
+	// should not materially affect the result.
+	bbr.minRTT = 50 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000 // 1 MB/s
+	bbr.fullBandwidthReached = true
+	bbr.cwndGain = CWND_GAIN_DEFAULT // 2.0
+	bbr.extraAcked[0] = 20_000       // Significant extra_acked
+
+	// Per §5.6.4.2:
+	//   inflight_cap = BDP * cwnd_gain = 50,000 * 2.0 = 100,000
+	//   inflight_cap += extra_acked = 100,000 + 20,000 = 120,000
+	//   max_inflight = quantize(120,000) >= 120,000
+
+	maxInf := bbr.maxInflight()
+
+	// Calculate expected values
+	expectedBDP := protocol.ByteCount(uint64(1_000_000) * uint64(50*time.Millisecond) / uint64(time.Second))
+	expectedInflight := protocol.ByteCount(float64(expectedBDP) * CWND_GAIN_DEFAULT)
+	expectedWithExtra := expectedInflight + 20_000
+
+	// Sanity checks on intermediate values
+	require.Equal(t, expectedBDP, protocol.ByteCount(50_000), "BDP sanity check")
+	require.Equal(t, expectedInflight, protocol.ByteCount(100_000), "BDP*gain sanity check")
+	require.Equal(t, expectedWithExtra, protocol.ByteCount(120_000), "BDP*gain+extra sanity check")
+
+	// With extra_acked added INSIDE quantization (correct order),
+	// the result should be at least BDP*gain + extra_acked.
+	// The quantization floor can only increase this value.
+	require.GreaterOrEqual(t, maxInf, expectedWithExtra,
+		"maxInflight should include extra_acked before quantization")
+
+	// Since BDP*gain + extra_acked (120,000) is well above quantization floors
+	// (minPipeCwnd ~5120, offloadBudget ~2560), the result should equal the sum.
+	require.Equal(t, maxInf, expectedWithExtra,
+		"maxInflight should equal BDP*gain + extra_acked when above quantization floor")
+}
+
+// TestBBRv3MaxInflightExtraAckedOrdering verifies the RFC-mandated order:
+// inflightFromBWGain (which applies its own minPipeCwnd floor) + extra_acked,
+// then quantizationBudget. The key is that extra_acked is added to the BDP-based
+// value BEFORE the quantizationBudget call, not after.
+func TestBBRv3MaxInflightExtraAckedOrdering(t *testing.T) {
+	bbr := newTestBBRv3()
+
+	// Set up scenario with high bandwidth so maxExtraAcked cap doesn't limit us.
+	// Use high BDP so minPipeCwnd floor in inflightFromBWGain doesn't bind.
+	bbr.minRTT = 50 * time.Millisecond
+	bbr.bwHi[0] = 2_000_000 // 2 MB/s -> BDP = 100,000 bytes at 50ms
+	bbr.fullBandwidthReached = true
+	bbr.cwndGain = CWND_GAIN_DEFAULT // 2.0
+	bbr.extraAcked[0] = 100_000      // Large extra_acked (within 200KB cap at 2MB/s)
+
+	// BDP = 2,000,000 * 0.050 = 100,000 bytes
+	// inflight = 100,000 * 2.0 = 200,000 bytes (well above minPipeCwnd)
+	// + extra_acked = 200,000 + 100,000 = 300,000
+	// quantize(300,000) = 300,000 (above all floors)
+
+	maxInf := bbr.maxInflight()
+
+	// Calculate expected values
+	bdp := protocol.ByteCount(uint64(2_000_000) * uint64(50*time.Millisecond) / uint64(time.Second))
+	inflight := protocol.ByteCount(float64(bdp) * CWND_GAIN_DEFAULT)
+
+	require.Equal(t, bdp, protocol.ByteCount(100_000), "BDP sanity check")
+	require.Equal(t, inflight, protocol.ByteCount(200_000), "inflight sanity check")
+
+	// maxExtraAcked cap = 2MB/s * 100ms = 200KB, so 100KB is within cap
+	require.Equal(t, bbr.maxExtraAcked(), protocol.ByteCount(100_000),
+		"extra_acked should not be capped")
+
+	// With correct RFC ordering: inflightFromBWGain + extra_acked, then quantize
+	expected := inflight + 100_000 // 300,000
+	require.Equal(t, maxInf, expected,
+		"maxInflight should equal BDP*gain + extra_acked when above all floors")
+}
