@@ -13,6 +13,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// ############################################################################
+// PART 1: RFC COMPLIANCE TESTS (draft-ietf-ccwg-bbr-05)
+// ############################################################################
+//
+// PURPOSE: These tests enforce MANDATORY behavior specified by the RFC.
+//
+// AGENTIC GUARDRAIL: Any agent modifying bbr_v3.go MUST NOT break these tests.
+// If a change causes a test failure here, the agent must either:
+//   (a) Revert the change - the RFC requirement is non-negotiable, OR
+//   (b) Cite a specific RFC section that justifies the new behavior
+//
+// Each test references the RFC section it enforces. Assertions include the
+// RFC requirement text so violations are self-documenting.
+// ############################################################################
+
 // ============================================================================
 // TEST FIXTURES AND HELPERS
 // ============================================================================
@@ -495,9 +510,29 @@ func TestBBRv3CwndQuantizationFloor(t *testing.T) {
 		"cwnd target should respect minPipeCwnd floor")
 }
 
-// ----------------------------------------------------------------------------
-// §5.3.3.6.4: ECN ALPHA CALCULATION
-// ----------------------------------------------------------------------------
+// ############################################################################
+// PART 2: IMPLEMENTATION STRATEGY TESTS
+// ############################################################################
+//
+// PURPOSE: These tests enforce CHOSEN behavior where the RFC grants discretion.
+//
+// AGENTIC GUARDRAIL: Agents MAY propose changes here if they can justify an
+// alternative implementation strategy. However, changes must:
+//   (a) Document why the alternative is preferred
+//   (b) Maintain consistency with the chosen strategy (e.g., all-tcp_bbr or all-custom)
+//   (c) Update both code AND tests together
+//
+// These are NOT optional tests - they enforce our implementation contracts.
+// They differ from Part 1 only in that the RFC permits alternative approaches.
+// ############################################################################
+
+// ============================================================================
+// ECN RESPONSE (tcp_bbr.c-aligned)
+// RFC §3.7: "This draft does not specify a specific response to ECN."
+// IMPLEMENTATION CHOICE: We follow Google's tcp_bbr.c approach:
+//   - EWMA ecn_alpha with gain = 1/16
+//   - inflightLo *= (1 - ecn_alpha * 1/3) on ECN-in-round
+// ============================================================================
 
 // TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha
 // per RFC §5.3.3.6.4: alpha = (1-g)*alpha + g*(CE/acked), g=1/16.
@@ -2293,11 +2328,16 @@ func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
 	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored to unconstrained")
 }
 
-// =============================================================================
-// GUARDRAIL TESTS - These verify the bugs identified in the code review.
-// These tests should FAIL with the current buggy implementation and PASS
-// after the fixes are applied.
-// =============================================================================
+// ############################################################################
+// PART 3: REGRESSION TESTS
+// ############################################################################
+//
+// PURPOSE: Pin bug fixes and edge cases discovered through testing/production.
+//
+// AGENTIC GUARDRAIL: These tests exist because something broke in the past.
+// Do not delete without understanding WHY the test was added. Each test
+// should reference the issue/commit that motivated it.
+// ############################################################################
 
 // TestBBRv3GuardrailStartupReachesFullBwWithoutAppLimited verifies Issue 1:
 // Bulk-transfer Startup must reach fullBandwidthReached without samples being
