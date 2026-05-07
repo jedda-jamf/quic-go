@@ -2032,6 +2032,14 @@ func (bbr *BBRv3) resetCongestionSignals() {
 	bbr.bytesLostInRound = 0
 }
 
+// saveCwnd captures cwnd before a phase transition that may compress it.
+// Draft-ietf-ccwg-bbr-05 §5.6.4.4 uses !InLossRecovery() && state != ProbeRTT;
+// this implementation uses !lossInRound && state != BBRProbeRTT instead.
+// The two differ during long recovery episodes that span multiple rounds:
+// - Spec's InLossRecovery() is true for the entire recovery episode
+// - Our lossInRound resets each round, allowing priorCwnd capture mid-episode
+// This is a deliberate QUIC adaptation that allows faster cwnd restoration
+// after partial recovery. Pinned by TestBBRv3SaveCwndPinsRoundScopedPredicate.
 func (bbr *BBRv3) saveCwnd() {
 	if bbr.state != BBRProbeRTT && !bbr.lossInRound {
 		bbr.priorCwnd = bbr.congestionWindow
