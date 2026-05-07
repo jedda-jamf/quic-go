@@ -424,7 +424,11 @@ type BBRv3 struct {
 	extraAckedWinRTTs uint8
 	extraAckedWinIdx  uint8
 
-	sentPackets   map[protocol.PacketNumber]bbrSentPacketState
+	sentPackets map[protocol.PacketNumber]bbrSentPacketState
+	// collisionPNs tracks raw PacketNumbers that have experienced PN-space
+	// collisions. Once a raw PN collides, all future packets with that PN
+	// (from any space) are ignored by the sampler.
+	collisionPNs  map[protocol.PacketNumber]struct{}
 	firstSentTime monotime.Time
 	deliveredTime monotime.Time
 
@@ -442,6 +446,7 @@ type BBRv3 struct {
 	pendingTotalLostAtSend uint64
 	pendingCEBytes         protocol.ByteCount
 	pendingNewestSentTime  monotime.Time
+	pendingNewestPacketNum protocol.PacketNumber
 
 	// Pending ECN feedback associated with next ACK event timestamp.
 	pendingECNEventValid bool
@@ -619,6 +624,26 @@ func (bbr *BBRv3) OnPacketSent(
 		bbr.cwndLimitedInRound = true
 	}
 
+	// COLLISION DETECTION: PN-space collision during handshake.
+	// BBR keys sentPackets by raw PacketNumber, which collides across QUIC's three
+	// packet-number spaces (Initial, Handshake, AppData). During handshake,
+	// Initial[0], Handshake[0], and 1-RTT[0] all map to key 0.
+	if _, exists := bbr.sentPackets[packetNumber]; exists {
+		if bbr.collisionPNs == nil {
+			bbr.collisionPNs = make(map[protocol.PacketNumber]struct{})
+		}
+		bbr.collisionPNs[packetNumber] = struct{}{}
+		delete(bbr.sentPackets, packetNumber)
+		return
+	}
+
+	// Check if this PN has collided before
+	if bbr.collisionPNs != nil {
+		if _, isCollision := bbr.collisionPNs[packetNumber]; isCollision {
+			return
+		}
+	}
+
 	// App-limited detection per RFC §4.1.1.3: use bubble semantics, not cwnd utilization.
 	// A packet is app-limited if sent while the app-limited bubble is active.
 	// The bubble is set by MarkAppLimited() when send was allowed but no data available.
@@ -690,12 +715,14 @@ func (bbr *BBRv3) OnPacketAcked(
 		bbr.pendingIsAppLimited = st.isAppLimited
 		bbr.pendingTotalLostAtSend = st.totalBytesLost
 		bbr.pendingNewestSentTime = st.sentTime
+		bbr.pendingNewestPacketNum = ackedPacketNumber
 		bbr.pendingCEBytes = bbr.consumePendingECNBytes(eventTime)
 	} else {
 		if priorInFlight > bbr.pendingPriorInFlight {
 			bbr.pendingPriorInFlight = priorInFlight
 		}
-		if st.sentTime.After(bbr.pendingNewestSentTime) {
+		if st.sentTime.After(bbr.pendingNewestSentTime) ||
+			(st.sentTime.Equal(bbr.pendingNewestSentTime) && ackedPacketNumber > bbr.pendingNewestPacketNum) {
 			bbr.pendingPriorDelivered = st.delivered
 			bbr.pendingPriorTime = st.deliveredTime
 			bbr.pendingSendElapsed = st.sentTime.Sub(st.firstSentTime)
@@ -703,6 +730,7 @@ func (bbr *BBRv3) OnPacketAcked(
 			bbr.pendingIsAppLimited = st.isAppLimited
 			bbr.pendingTotalLostAtSend = st.totalBytesLost
 			bbr.pendingNewestSentTime = st.sentTime
+			bbr.pendingNewestPacketNum = ackedPacketNumber
 		}
 	}
 	bbr.pendingAckedBytes += ackedBytes
@@ -719,6 +747,15 @@ func (bbr *BBRv3) OnCongestionEvent(
 	if lostBytes <= 0 {
 		return
 	}
+	// COLLISION CHECK: Skip loss processing for collided PNs.
+	// PN-space collisions during handshake mean we don't have reliable state
+	// for this packet number, so we must not corrupt the loss model.
+	if bbr.collisionPNs != nil {
+		if _, isCollision := bbr.collisionPNs[packetNumber]; isCollision {
+			return
+		}
+	}
+
 	bbr.totalBytesLost += uint64(lostBytes)
 	bbr.bytesLostInRound += lostBytes
 	bbr.noteLoss()
@@ -1003,6 +1040,7 @@ func (bbr *BBRv3) clearPendingAckEvent() {
 	bbr.pendingTotalLostAtSend = 0
 	bbr.pendingCEBytes = 0
 	bbr.pendingNewestSentTime = 0
+	bbr.pendingNewestPacketNum = 0
 	// Clear ACK-event state from OnAckEventStart
 	bbr.ackEventBytesInFlight = 0
 	bbr.ackEventTime = 0
