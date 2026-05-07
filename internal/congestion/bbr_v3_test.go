@@ -611,8 +611,9 @@ func TestBBRv3CwndQuantizationFloor(t *testing.T) {
 //   - inflightLo *= (1 - ecn_alpha * 1/3) on ECN-in-round
 // ============================================================================
 
-// TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha
-// per RFC §5.3.3.6.4: alpha = (1-g)*alpha + g*(CE/acked), g=1/16.
+// TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha.
+// IMPLEMENTATION: tcp_bbr.c bbr_update_ecn_alpha() uses alpha = (1-g)*alpha + g*(CE/acked), g=1/16.
+// Note: RFC §3.7 does not mandate this formula - this is our chosen implementation.
 func TestBBRv3ECNAlphaCalculation(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -670,6 +671,7 @@ func TestBBRv3ECNAlphaCalculation(t *testing.T) {
 }
 
 // TestBBRv3ECNAlphaBounds verifies ecnAlpha stays in [0, 1] range.
+// IMPLEMENTATION: tcp_bbr.c clamps ecn_alpha to [0, BBR_UNIT].
 func TestBBRv3ECNAlphaBounds(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.ecnEligible = true
@@ -706,6 +708,7 @@ func TestBBRv3ECNAlphaBounds(t *testing.T) {
 }
 
 // TestBBRv3ECNAlphaConvergence verifies alpha converges to marking rate.
+// IMPLEMENTATION: tcp_bbr.c EWMA with g=1/16 converges to steady-state CE ratio.
 func TestBBRv3ECNAlphaConvergence(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.ecnEligible = true
@@ -726,8 +729,9 @@ func TestBBRv3ECNAlphaConvergence(t *testing.T) {
 		"ecnAlpha should converge to ~0.5 with sustained 50% CE")
 }
 
-// TestBBRv3ECNAlphaReducesInflightLo verifies ECN alpha affects inflightLo
-// reduction per RFC §5.5.10.2: inflightLo *= (1 - ecnAlpha * ECN_FACTOR).
+// TestBBRv3ECNAlphaReducesInflightLo verifies ECN alpha affects inflightLo reduction.
+// IMPLEMENTATION: tcp_bbr.c uses inflightLo *= (1 - ecnAlpha * ECN_FACTOR) where ECN_FACTOR=1/3.
+// Note: RFC §3.7 does not mandate this formula - this is our chosen implementation.
 func TestBBRv3ECNAlphaReducesInflightLo(t *testing.T) {
 	bbr := newTestBBRv3()
 	setupProbeBWPhase(bbr, probeBWCruise)
