@@ -1966,42 +1966,58 @@ func TestBBRv3LowerBoundsEventPath(t *testing.T) {
 	now := monotime.Now()
 
 	// Establish steady state in ProbeBW CRUISE with known bounds
+	// CRUISE is NOT a probing phase, so adaptLowerBounds will run
 	setupProbeBWPhase(bbr, probeBWCruise)
-	bbr.bwLo = 1_000_000
-	bbr.inflightLo = 100_000
+
+	// Set initial bounds - these will be adapted on loss
+	initialBwLo := protocol.ByteCount(1_000_000)
+	initialInflightLo := protocol.ByteCount(100_000)
+	bbr.bwLo = initialBwLo
+	bbr.inflightLo = initialInflightLo
+
+	// Set latest values - these floor the adaptation per RFC §5.5.10:
+	// bwLo = max(bwLatest, bwLo * BETA), inflightLo = max(inflightLatest, inflightLo * BETA)
 	bbr.bwLatest = 800_000
 	bbr.inflightLatest = 80_000
 
-	// Send some packets
+	// Initialize delivered counters for round tracking
+	bbr.totalBytesAcked = 10_000
+	bbr.lossRoundDelivered = 0 // Will trigger lossRoundStart when priorDelivered >= this
+
+	// Send packets - these establish the round boundary
 	for i := 1; i <= 5; i++ {
 		bbr.OnPacketSent(now, protocol.ByteCount(i*1200), protocol.PacketNumber(i), 1200, true)
 	}
 
 	// Trigger loss through OnCongestionEvent (production path)
 	bbr.OnCongestionEvent(1, 1200, 0)
+	require.True(t, bbr.lossInRound, "lossInRound MUST be set after OnCongestionEvent")
 
-	// Verify loss was recorded
-	require.True(t, bbr.lossInRound,
-		"lossInRound MUST be set after OnCongestionEvent")
-
-	// Complete round via ACKs to trigger adaptLowerBounds
+	// ACK remaining packets to complete the round
+	// The ACK processing will trigger lossRoundStart when priorDelivered >= lossRoundDelivered
 	ackTime := now.Add(50 * time.Millisecond)
-	bbr.OnPacketAcked(2, 1200, 0, ackTime)
-	bbr.OnPacketAcked(3, 1200, 0, ackTime)
+	for i := 2; i <= 5; i++ {
+		bbr.OnPacketAcked(protocol.PacketNumber(i), 1200, protocol.ByteCount((i-1)*1200), ackTime)
+	}
 
-	// Trigger round boundary
-	bbr.totalBytesAcked += 10_000
-	bbr.nextRoundDelivered = bbr.totalBytesAcked - 5_000 // Force round_start
-	bbr.lossRoundStart = true
-
+	// Process ACK event - this triggers updateLatestDeliverySignals -> updateCongestionSignals -> adaptLowerBounds
 	bbr.OnAckEventEnd(ackTime)
 
-	// RFC §5.5.10: After loss round, bwLo and inflightLo should be reduced
-	// The exact values depend on BETA (0.7), but they should be <= original
-	require.LessOrEqual(t, bbr.bwLo, protocol.ByteCount(1_000_000),
-		"RFC §5.5.10: bwLo MUST be reduced or unchanged after loss round")
-	require.LessOrEqual(t, bbr.inflightLo, protocol.ByteCount(100_000),
-		"RFC §5.5.10: inflightLo MUST be reduced or unchanged after loss round")
+	// RFC §5.5.10: After loss round, bounds are adapted using BETA = 0.70 (1 - 0.30):
+	// bwLo = max(bwLatest, bwLo * 0.70) = max(800_000, 700_000) = 800_000
+	// inflightLo = max(inflightLatest, inflightLo * 0.70) = max(80_000, 70_000) = 80_000
+	expectedBwLo := protocol.ByteCount(800_000)         // max(bwLatest, bwLo*0.70)
+	expectedInflightLo := protocol.ByteCount(80_000)   // max(inflightLatest, inflightLo*0.70)
+
+	require.Less(t, bbr.bwLo, initialBwLo,
+		"RFC §5.5.10: bwLo MUST be reduced after loss round (was %d, now %d)", initialBwLo, bbr.bwLo)
+	require.Equal(t, expectedBwLo, bbr.bwLo,
+		"RFC §5.5.10: bwLo MUST equal max(bwLatest, bwLo * BETA)")
+
+	require.Less(t, bbr.inflightLo, initialInflightLo,
+		"RFC §5.5.10: inflightLo MUST be reduced after loss round (was %d, now %d)", initialInflightLo, bbr.inflightLo)
+	require.Equal(t, expectedInflightLo, bbr.inflightLo,
+		"RFC §5.5.10: inflightLo MUST equal max(inflightLatest, inflightLo * BETA)")
 }
 
 // TestBBRv3LossModelPerPacketState verifies that OnPacketSent captures
