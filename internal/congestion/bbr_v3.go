@@ -1782,6 +1782,8 @@ func (bbr *BBRv3) setPacingRateWithGain(gain float64) {
 	if rate <= 0 {
 		rate = 1
 	}
+	// Pre-fullBandwidthReached, the pacing rate ratchets up only. This matches
+	// tcp_bbr.c — during the Startup ramp the rate must not be allowed to fall.
 	if bbr.fullBandwidthReached || rate > bbr.pacingRate {
 		bbr.pacingRate = rate
 	}
