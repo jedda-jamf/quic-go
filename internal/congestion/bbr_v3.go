@@ -135,15 +135,22 @@ const (
 	// ==========================================================================
 	// ECN CONSTANTS
 	// ==========================================================================
+	//
+	// RFC draft-ietf-ccwg-bbr-05 §3.7 states: "This draft does not specify a
+	// specific response to ECN, and instead leaves it as an area for future work."
+	//
+	// IMPLEMENTATION CHOICE: We align with Google's tcp_bbr.c (Linux kernel BBRv3):
+	//   - Track ECN marking ratio via EWMA with gain = 1/16
+	//   - Reduce inflightLo by (ecn_alpha * 1/3) when ECN observed in round
+	//
+	// This approach is tested in bbr_v3_test.go Part 2 (Implementation Strategy Tests).
 
-	// ECN_ALPHA_GAIN = 1/16 per tcp_bbr.c
-	// EWMA gain for ecn_alpha updates.
-	// See also: tcp_bbr.c:bbr_ecn_alpha_gain = BBR_UNIT / 16
+	// ECN_ALPHA_GAIN is the EWMA smoothing factor for ecn_alpha.
+	// Source: tcp_bbr.c bbr_ecn_alpha_gain = BBR_UNIT / 16
 	ECN_ALPHA_GAIN = 1.0 / 16.0
 
-	// ECN_FACTOR = 1/3 per tcp_bbr.c
-	// Factor for ECN-driven inflight_lo reduction.
-	// See also: tcp_bbr.c:bbr_ecn_factor = BBR_UNIT / 3
+	// ECN_FACTOR is the inflightLo reduction multiplier.
+	// Source: tcp_bbr.c bbr_ecn_factor = BBR_UNIT / 3
 	ECN_FACTOR = 1.0 / 3.0
 
 	// ECN_THRESH = 0.5 per tcp_bbr.c
@@ -1121,7 +1128,9 @@ func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 	bbr.nextRoundDelivered = bbr.totalBytesAcked
 }
 
-// updateECNAlpha updates the ECN alpha EWMA per tcp_bbr.c bbr_update_ecn_alpha().
+// updateECNAlpha updates the ECN alpha EWMA.
+// This is an IMPLEMENTATION CHOICE following tcp_bbr.c bbr_update_ecn_alpha().
+// The RFC does not mandate this formula - see §3.7.
 func (bbr *BBRv3) updateECNAlpha(rs bbrRateSample) {
 	if !bbr.roundStart || !bbr.ecnEligible {
 		return
