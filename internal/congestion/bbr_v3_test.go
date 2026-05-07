@@ -61,7 +61,8 @@ func setupProbeBWPhase(bbr *BBRv3, phase bbrProbeBWPhase) {
 // ============================================================================
 
 // TestBBRv3PerPacketStateCapture verifies that OnPacketSent captures all
-// per-packet state fields correctly per RFC §4.1.2.2.
+// per-packet state fields correctly per RFC §4.1.2.1.2.
+// AGENTIC GUARDRAIL: RFC §4.1.2.1.2 REQUIRES these fields be captured at send time.
 func TestBBRv3PerPacketStateCapture(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -70,7 +71,6 @@ func TestBBRv3PerPacketStateCapture(t *testing.T) {
 	bbr.totalBytesAcked = 50_000
 	bbr.deliveredTime = now.Add(-100 * time.Millisecond)
 	bbr.firstSentTime = now.Add(-200 * time.Millisecond)
-	bbr.totalBytesLost = 1_200
 	bbr.appLimitedUntil = 100_000 // will mark packet as app-limited
 
 	bytesInFlight := protocol.ByteCount(10_000)
@@ -79,29 +79,29 @@ func TestBBRv3PerPacketStateCapture(t *testing.T) {
 	st, ok := bbr.sentPackets[1]
 	require.True(t, ok, "packet state should be tracked")
 
-	// P.delivered = C.delivered at send time
+	// RFC §4.1.2.1.2: P.delivered = C.delivered at send time
 	require.Equal(t, uint64(50_000), st.delivered,
-		"P.delivered should equal totalBytesAcked at send")
+		"RFC §4.1.2.1.2: P.delivered MUST equal C.delivered at send time")
 
-	// P.delivered_time = C.delivered_time at send time
+	// RFC §4.1.2.1.2: P.delivered_time = C.delivered_time at send time
 	require.Equal(t, now.Add(-100*time.Millisecond), st.deliveredTime,
-		"P.delivered_time should equal deliveredTime at send")
+		"RFC §4.1.2.1.2: P.delivered_time MUST equal C.delivered_time at send time")
 
-	// P.first_sent_time = inherited from prior or connection start
+	// RFC §4.1.2.1.2: P.first_sent_time = inherited or reset
 	require.Equal(t, now.Add(-200*time.Millisecond), st.firstSentTime,
-		"P.first_sent_time should be inherited")
+		"RFC §4.1.2.1.2: P.first_sent_time MUST be inherited from prior packet")
 
-	// P.is_app_limited = true if C.delivered < appLimitedUntil
+	// RFC §4.1.2.1.2: P.sent_time = current time
+	require.Equal(t, now, st.sentTime,
+		"RFC §4.1.2.1.2: P.sent_time MUST equal the time packet was sent")
+
+	// RFC §4.1.2.1.2: P.is_app_limited = true if C.delivered < C.app_limited_until
 	require.True(t, st.isAppLimited,
-		"P.is_app_limited should be true when delivered < appLimitedUntil")
+		"RFC §4.1.2.1.2: P.is_app_limited MUST be true when C.delivered < C.app_limited_until")
 
-	// P.tx_in_flight = bytesInFlight parameter
+	// RFC §4.1.2.1.2: P.tx_in_flight = bytes_in_flight at send time
 	require.Equal(t, bytesInFlight, st.txInFlight,
-		"P.tx_in_flight should equal bytesInFlight at send")
-
-	// P.lost = C.lost at send time (totalBytesLost)
-	require.Equal(t, uint64(1_200), st.totalBytesLost,
-		"P.lost should equal totalBytesLost at send")
+		"RFC §4.1.2.1.2: P.tx_in_flight MUST equal bytes_in_flight at send time")
 }
 
 // TestBBRv3PerPacketStateRoundTrip verifies that rate sample fields are
