@@ -277,6 +277,89 @@ func TestBBRv3NonCollidedPacketsUnaffected(t *testing.T) {
 	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(1))
 }
 
+// TestBBRv3ACKLookupMissReturnsEarly verifies that ACKs for packets with no
+// sampler state (lookup miss) return early without updating delivery-rate
+// sampler state. This prevents fabricated state from poisoning max_bw during
+// handshake when minRTT may still be zero.
+func TestBBRv3ACKLookupMissReturnsEarly(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Record initial state
+	initialAcked := bbr.totalBytesAcked
+	initialPendingValid := bbr.pendingAckEventValid
+
+	// ACK a packet that was never sent (lookup miss)
+	bbr.OnPacketAcked(999, 1200, 5000, now)
+
+	// totalBytesAcked should NOT be updated — we can't trust fabricated state
+	require.Equal(t, initialAcked, bbr.totalBytesAcked,
+		"totalBytesAcked should not change on lookup miss")
+
+	// No pending ACK event should be created from fabricated state
+	require.Equal(t, initialPendingValid, bbr.pendingAckEventValid,
+		"pending ACK event should not be created from lookup miss")
+
+	// priorInFlight should be preserved (transport-level info)
+	require.Equal(t, protocol.ByteCount(5000), bbr.pendingPriorInFlight,
+		"priorInFlight should be preserved from lookup miss")
+}
+
+// TestBBRv3ACKLookupMissDoesNotStealECN verifies that lookup misses do not
+// consume pending ECN bytes that belong to real packets in the same ACK event.
+func TestBBRv3ACKLookupMissDoesNotStealECN(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up ECN eligibility
+	bbr.minRTT = 3 * time.Millisecond
+
+	// Send a real packet
+	bbr.OnPacketSent(now, 0, 1, 1200, true)
+
+	// Receive ECN feedback
+	bbr.OnECNFeedback(1000, 100, 0, 10, 0, now.Add(50*time.Millisecond))
+	require.True(t, bbr.pendingECNEventValid)
+	require.Greater(t, bbr.pendingECNCEBytes, protocol.ByteCount(0))
+
+	// ACK lookup miss first (packet 999 never sent)
+	bbr.OnPacketAcked(999, 1200, 5000, now.Add(50*time.Millisecond))
+
+	// ECN bytes should NOT be consumed by the miss
+	require.True(t, bbr.pendingECNEventValid,
+		"ECN should not be consumed by lookup miss")
+
+	// ACK the real packet
+	bbr.OnPacketAcked(1, 1200, 3800, now.Add(50*time.Millisecond))
+
+	// Real packet should consume the ECN bytes
+	require.Greater(t, bbr.pendingCEBytes, protocol.ByteCount(0),
+		"real packet should get the ECN bytes")
+}
+
+// TestBBRv3AllMissACKEventClearsECN verifies that if an ACK event contains
+// only missed packets (no real sampler state), stale ECN is cleared at event end.
+func TestBBRv3AllMissACKEventClearsECN(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up ECN eligibility and pending ECN
+	bbr.minRTT = 3 * time.Millisecond
+	bbr.OnECNFeedback(1000, 100, 0, 10, 0, now)
+
+	require.True(t, bbr.pendingECNEventValid)
+
+	// ACK event with only misses
+	bbr.OnPacketAcked(999, 1200, 5000, now)
+	bbr.OnAckEventEnd(now)
+
+	// Stale ECN should be cleared
+	require.False(t, bbr.pendingECNEventValid,
+		"all-miss ACK event should clear stale ECN")
+	require.Equal(t, protocol.ByteCount(0), bbr.pendingECNCEBytes,
+		"pending ECN CE bytes should be cleared")
+}
+
 // =============================================================================
 // M1a: ECN GUARD AT ZERO minRTT TESTS
 // =============================================================================

@@ -691,15 +691,23 @@ func (bbr *BBRv3) OnPacketAcked(
 
 	st, ok := bbr.sentPackets[ackedPacketNumber]
 	if !ok {
-		st = bbrSentPacketState{
-			bytes:          ackedBytes,
-			delivered:      bbr.totalBytesAcked,
-			deliveredTime:  bbr.deliveredTime,
-			firstSentTime:  eventTime,
-			sentTime:       eventTime,
-			txInFlight:     priorInFlight,
-			totalBytesLost: bbr.totalBytesLost,
+		// This packet was either:
+		// 1. Part of a PN-space collision (detected on send, state never stored)
+		// 2. Already processed and deleted
+		// 3. A non-retransmittable packet (state never stored)
+		//
+		// We cannot make a meaningful observation about this packet. Make it
+		// invisible to BBR's sampler, but preserve transport-level priorInFlight
+		// which comes from the QUIC ackhandler, not BBR's per-packet tracking.
+		//
+		// NOTE: We intentionally do NOT consume pending ECN bytes here. In a
+		// mixed ACK event (miss + real packets), consuming ECN on the miss would
+		// steal CE bytes from real packets processed later in the same event.
+		// All-miss events are cleaned up in OnAckEventEnd.
+		if priorInFlight > bbr.pendingPriorInFlight {
+			bbr.pendingPriorInFlight = priorInFlight
 		}
+		return
 	}
 
 	bbr.totalBytesAcked += uint64(ackedBytes)
@@ -885,6 +893,16 @@ func (bbr *BBRv3) bandwidthEstimateForPacer() Bandwidth {
 func (bbr *BBRv3) OnAckEventEnd(eventTime monotime.Time) {
 	if bbr.pendingAckEventValid && bbr.pendingAckEventTime.Equal(eventTime) {
 		bbr.processPendingAckEvent(eventTime)
+	}
+	// If the ACK event contained only missed/collided packets, no real pending
+	// ACK event was created and therefore no packet consumed pending ECN bytes.
+	// Clear ECN state for this event so stale CE bytes cannot leak into a later
+	// same-timestamp event, while preserving ECN for mixed miss+real events.
+	if !bbr.pendingAckEventValid &&
+		bbr.pendingECNEventValid &&
+		bbr.pendingECNEventTime.Equal(eventTime) {
+		bbr.pendingECNEventValid = false
+		bbr.pendingECNCEBytes = 0
 	}
 }
 
