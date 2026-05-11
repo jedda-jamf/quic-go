@@ -227,13 +227,19 @@ const (
 
 // bbrProbeBWPhase represents the sub-phases within ProbeBW state.
 // Per RFC §5.3.3, ProbeBW cycles through: DOWN -> CRUISE -> REFILL -> UP -> DOWN
+//
+// Each phase serves a distinct purpose in steady-state bandwidth utilization:
+//   - DOWN (§5.3.3.1):   Decelerate to drain queue, leave headroom
+//   - CRUISE (§5.3.3.2): Match sending rate to delivery rate
+//   - REFILL (§5.3.3.3): Reset short-term model, refill pipe
+//   - UP (§5.3.3.4):     Probe for higher bandwidth
 type bbrProbeBWPhase uint8
 
 const (
-	probeBWUp bbrProbeBWPhase = iota
-	probeBWDown
-	probeBWCruise
-	probeBWRefill
+	probeBWUp     bbrProbeBWPhase = iota // §5.3.3.4: pacing_gain=1.25, cwnd_gain=2.25
+	probeBWDown                          // §5.3.3.1: pacing_gain=0.90, cwnd_gain=2.0
+	probeBWCruise                        // §5.3.3.2: pacing_gain=1.0, cwnd_gain=2.0
+	probeBWRefill                        // §5.3.3.3: pacing_gain=1.0, cwnd_gain=2.0
 )
 
 func (p bbrProbeBWPhase) String() string {
@@ -251,26 +257,55 @@ func (p bbrProbeBWPhase) String() string {
 	}
 }
 
-// bbrAckPhase tracks probe feedback timing within a bandwidth probe cycle.
+// bbrAckPhase tracks ACK processing state within a bandwidth probe cycle.
+// Per RFC §5.3.3.6 (ProbeBW Algorithm Details), the ack_phase state machine
+// coordinates between probing phases and the max_bw filter rotation:
+//
+//   - INIT:           Default state, not in a probe cycle
+//   - REFILLING:      In REFILL phase, waiting for round to complete
+//   - PROBE_STARTING: Entered UP phase, waiting for round to deliver feedback
+//   - PROBE_FEEDBACK: Receiving samples from UP probing
+//   - PROBE_STOPPING: In DOWN phase, waiting to advance max_bw filter
+//
+// The key function is in adaptUpperBounds: when PROBE_STOPPING && round_start,
+// we advance the max_bw filter to rotate out stale samples from the previous cycle.
 type bbrAckPhase uint8
 
 const (
-	ackPhaseInit bbrAckPhase = iota
-	ackPhaseRefilling
-	ackPhaseProbeStarting
-	ackPhaseProbeFeedback
-	ackPhaseProbeStopping
+	ackPhaseInit          bbrAckPhase = iota // Default: not in probe cycle
+	ackPhaseRefilling                        // REFILL: waiting for round
+	ackPhaseProbeStarting                    // UP: waiting for feedback
+	ackPhaseProbeFeedback                    // UP: receiving probe samples
+	ackPhaseProbeStopping                    // DOWN: will advance max_bw filter
 )
 
 // BBRState represents the top-level BBR state machine states.
-// Per RFC §5.1: Startup -> Drain -> ProbeBW <-> ProbeRTT
+// Per RFC §5.1 (State Machine) and §5.1.1 (State Transition Diagram):
+//
+//	              |
+//	              V
+//	     +---> Startup  ------+
+//	     |        |           |
+//	     |        V           |
+//	     |     Drain  --------+
+//	     |        |           |
+//	     |        V           |
+//	     +---> ProbeBW <------+
+//	     |                    |
+//	     +---- ProbeRTT <-----+
+//
+// State purposes:
+//   - Startup (§5.3.1): Exponential search for available bandwidth
+//   - Drain (§5.3.2):   Drain queue created during Startup
+//   - ProbeBW (§5.3.3): Steady-state bandwidth probing with 4-phase cycle
+//   - ProbeRTT (§5.3.4): Cooperative RTT measurement by draining queue
 type BBRState int
 
 const (
-	BBRStartup BBRState = iota
-	BBRDrain
-	BBRProbeBW
-	BBRProbeRTT
+	BBRStartup  BBRState = iota // §5.3.1: pacing_gain=2.77, cwnd_gain=2.0
+	BBRDrain                    // §5.3.2: pacing_gain=0.5, cwnd_gain=2.0
+	BBRProbeBW                  // §5.3.3: steady-state with 4-phase cycle
+	BBRProbeRTT                 // §5.3.4: pacing_gain=1.0, cwnd_gain=0.5
 )
 
 // String returns the string representation of BBRState.
@@ -290,34 +325,57 @@ func (s BBRState) String() string {
 }
 
 // bbrSentPacketState tracks per-packet delivery sampler snapshots.
-// This enables delivery rate calculation per RFC §4.2 (Delivery Rate Sampling).
+// Per RFC §4.1.2.1.2 (Per-packet (P) state), each transmitted packet stores:
+//   - P.delivered      (bytes):      C.delivered at send time
+//   - P.delivered_time (time):       C.delivered_time at send time
+//   - P.first_send_time (time):      C.first_send_time at send time
+//   - P.send_time       (time):      scheduled transmission time
+//   - P.tx_in_flight   (bytes):      C.inflight immediately after transmission
+//   - P.is_app_limited (bool):       true if C.app_limited != 0 at send time
+//   - P.lost           (bytes):      C.lost at send time (for loss-round detection)
+//
+// These fields enable delivery rate calculation per RFC §4.1.2.3 (Upon receiving an ACK).
 type bbrSentPacketState struct {
-	bytes          protocol.ByteCount
-	delivered      uint64
-	deliveredTime  monotime.Time
-	firstSentTime  monotime.Time
-	sentTime       monotime.Time
-	txInFlight     protocol.ByteCount
-	isAppLimited   bool
-	totalBytesLost uint64
+	bytes          protocol.ByteCount // P.data_length: packet size for volume accounting
+	delivered      uint64             // P.delivered: C.delivered snapshot at send time
+	deliveredTime  monotime.Time      // P.delivered_time: C.delivered_time snapshot
+	firstSentTime  monotime.Time      // P.first_send_time: origin of send_elapsed interval
+	sentTime       monotime.Time      // P.send_time: scheduled pacing departure time
+	txInFlight     protocol.ByteCount // P.tx_in_flight: C.inflight after this packet
+	isAppLimited   bool               // P.is_app_limited: app-limited bubble active at send
+	totalBytesLost uint64             // P.lost: C.lost at send time (§5.5.10 loss-round)
 }
 
-// bbrRateSample holds per-ACK delivery rate information.
-// Corresponds to RFC §4.2 delivery rate calculation.
+// bbrRateSample holds per-ACK delivery rate sample output.
+// Per RFC §4.1.2.1.3 (Rate Sample (rs) Output), this structure captures:
+//   - RS.delivery_rate:     delivery rate sample (RS.delivered / RS.interval)
+//   - RS.is_app_limited:    P.is_app_limited from newest delivered packet
+//   - RS.interval:          sampling interval (max of send_elapsed, ack_elapsed)
+//   - RS.delivered:         C.delivered - P.delivered (volume delivered)
+//   - RS.prior_delivered:   P.delivered from newest delivered packet
+//   - RS.prior_time:        P.delivered_time from newest delivered packet
+//   - RS.send_elapsed:      P.send_time - P.first_send_time
+//   - RS.ack_elapsed:       C.delivered_time - P.delivered_time
+//
+// Additional fields beyond RFC for BBRv3 congestion signal tracking:
+//   - RS.tx_in_flight:      P.tx_in_flight for loss rate calculation (§2.7)
+//   - RS.lost:              volume lost since packet send (§5.5.10)
+//   - RS.newly_acked:       volume acked in this ACK event
+//   - RS.delivered_ce:      CE-marked bytes for ECN response (tcp_bbr.c)
 type bbrRateSample struct {
-	newlyAcked     protocol.ByteCount
-	delivered      protocol.ByteCount
-	deliveredCE    protocol.ByteCount
-	deliveryRate   protocol.ByteCount // bytes/s
-	interval       time.Duration
-	sendElapsed    time.Duration
-	ackElapsed     time.Duration
-	txInFlight     protocol.ByteCount
-	bytesInFlight  protocol.ByteCount
-	priorInFlight  protocol.ByteCount
-	priorDelivered uint64
-	lost           protocol.ByteCount
-	isAppLimited   bool
+	newlyAcked     protocol.ByteCount // RS.newly_acked: volume acked in this event
+	delivered      protocol.ByteCount // RS.delivered: C.delivered - P.delivered
+	deliveredCE    protocol.ByteCount // CE-marked bytes (ECN, tcp_bbr.c extension)
+	deliveryRate   protocol.ByteCount // RS.delivery_rate: bytes/s
+	interval       time.Duration      // RS.interval: max(send_elapsed, ack_elapsed)
+	sendElapsed    time.Duration      // RS.send_elapsed: P.send_time - P.first_send_time
+	ackElapsed     time.Duration      // RS.ack_elapsed: C.delivered_time - P.delivered_time
+	txInFlight     protocol.ByteCount // RS.tx_in_flight: P.tx_in_flight for loss calc
+	bytesInFlight  protocol.ByteCount // C.inflight after ACK processing
+	priorInFlight  protocol.ByteCount // C.inflight before ACK processing
+	priorDelivered uint64             // RS.prior_delivered: P.delivered snapshot
+	lost           protocol.ByteCount // RS.lost: bytes lost since send (§5.5.10)
+	isAppLimited   bool               // RS.is_app_limited: app-limited at send
 }
 
 // BBRv3 implements the send-side congestion controller.
@@ -929,13 +987,21 @@ func (bbr *BBRv3) OnAckEventStart(eventTime monotime.Time, bytesInFlight protoco
 	bbr.ackEventTime = eventTime
 }
 
-// MarkAppLimited implements RFC §4.1.1.3 "app-limited" bubble semantics.
-// Called when the application had a send opportunity but no data to send.
-// This is distinct from cwnd-limited detection used in earlier versions.
+// MarkAppLimited implements RFC §4.1.2.4 (Detecting application-limited phases).
 //
-// The "bubble" extends until all currently in-flight data is acknowledged.
-// Samples sent during the bubble are marked app-limited and excluded from
-// bandwidth estimation in checkFullBwReached().
+// An "app-limited bubble" begins when the application could send but has no data:
+//   - Congestion window allows sending (C.inflight < C.cwnd)
+//   - Pacing rate allows sending
+//   - Yet there is no data to send (NoUnsentData() && pending_transmissions == 0)
+//
+// Per RFC: "This idle time means that any delivery rate sample obtained from
+// this data packet, and any rate sample from a packet that follows it in the
+// next round trip, is an application-limited sample that potentially
+// underestimates the true available bandwidth."
+//
+// The bubble extends until C.delivered > C.app_limited (the bubble has "exited"
+// the data pipeline). Samples sent during the bubble have P.is_app_limited=true
+// and are excluded from the full-bandwidth estimator in checkFullBwReached().
 func (bbr *BBRv3) MarkAppLimited(bytesInFlight protocol.ByteCount) {
 	// Per RFC §4.1.1.3: app_limited = (delivered + bytes_in_flight) ? : 1
 	// The bubble ends when we've delivered past this point.
@@ -1112,7 +1178,17 @@ func (bbr *BBRv3) bytesInFlightForAckEvent() protocol.ByteCount {
 	return bbr.bytesInFlightAfterACK()
 }
 
-// updateRoundStart checks for round boundary crossing per RFC §5.2.
+// updateRoundStart checks for packet-timed round trip boundary crossing.
+// Per RFC §5.5.1 (BBR.round_count: Tracking Packet-Timed Round Trips):
+//
+// A round trip ends when the ACK for a packet sent after the start of the
+// current round arrives. We track this by:
+//   1. On round start, set next_round_delivered = C.delivered
+//   2. When an ACK has P.delivered >= next_round_delivered, the round ends
+//
+// This is fundamentally different from wall-clock RTT: it measures the time
+// for a flight of data to traverse the path, providing a natural unit for
+// bandwidth probing and model updates that is robust to ACK compression/delays.
 func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 	bbr.roundStart = false
 	if rs.priorDelivered < bbr.nextRoundDelivered {
@@ -1131,7 +1207,7 @@ func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 // updateECNAlpha updates the ECN alpha EWMA.
 // This is an IMPLEMENTATION CHOICE following tcp_bbr.c bbr_update_ecn_alpha().
 // The RFC does not mandate this formula - see §3.7.
-func (bbr *BBRv3) updateECNAlpha(rs bbrRateSample) {
+func (bbr *BBRv3) updateECNAlpha(_ bbrRateSample) {
 	if !bbr.roundStart || !bbr.ecnEligible {
 		return
 	}
@@ -1222,8 +1298,22 @@ func (bbr *BBRv3) updateCongestionSignals(rs bbrRateSample) {
 	bbr.ecnInRound = false
 }
 
-// adaptLowerBounds implements lower-bound adaptation per tcp_bbr.c bbr_adapt_lower_bounds().
-// The rate sample parameter is reserved for future use (e.g., advanced loss analysis).
+// adaptLowerBounds implements short-term model adaptation per RFC §5.5.10.
+//
+// The short-term model (bw_shortterm, inflight_shortterm) responds to recent
+// congestion signals, while the long-term model (max_bw, inflight_longterm)
+// maintains a robust history for probing. This function adapts the short-term
+// model on loss_round boundaries (not every ACK).
+//
+// Loss response (§5.5.10.1):
+//   bwLo = max(bwLatest, bwLo * (1 - BETA))           ; BETA = 0.30
+//   inflightLo = max(inflightLatest, inflightLo * (1 - BETA))
+//
+// ECN response (tcp_bbr.c bbr_adapt_lower_bounds, not RFC-specified):
+//   inflightLo = inflightLo * (1 - ecnAlpha * ECN_FACTOR) ; ECN_FACTOR = 1/3
+//
+// Note: Probing phases (Startup, REFILL, UP) skip lower-bound adaptation
+// to allow aggressive probing per isProbingBandwidth().
 func (bbr *BBRv3) adaptLowerBounds(bbrRateSample) {
 	if bbr.isProbingBandwidth() {
 		return
@@ -1325,15 +1415,22 @@ func (bbr *BBRv3) handleQueueTooHighInStartup() {
 	bbr.inflightHi = max(bdp, bbr.inflightLatest)
 }
 
-// checkFullBwReached implements full bandwidth detection per
-// draft-ietf-ccwg-bbr-05 §5.3.1.2 BBRCheckFullBWReached().
+// checkFullBwReached implements the "filled pipe" estimator per
+// RFC §5.3.1.2 (Exiting Acceleration Based on Bandwidth Plateau).
 //
-// Per the draft, this function MUST only run on round_start boundaries.
-// The entire check (both the growth comparison and the count increment)
-// is gated on round_start to ensure that bandwidth growth is evaluated
-// once per round trip, not on every ACK. Without this gate, intra-round
-// delivery rate fluctuations can repeatedly reset the full_bw counter,
-// preventing Startup from ever detecting a bandwidth plateau.
+// The algorithm detects bandwidth saturation by looking for a plateau in
+// RS.delivery_rate across multiple packet-timed round trips:
+//   1. If delivery_rate >= full_bw * 1.25 (25% growth), reset counter
+//   2. Otherwise, increment full_bw_count
+//   3. After 3 consecutive rounds without 25% growth, declare filled pipe
+//
+// CRITICAL: This function MUST only run on round_start boundaries.
+// Per RFC §5.3.1.2: "upon an ACK...when the delivery rate sample is not
+// application-limited, BBR runs the 'full pipe' estimator."
+// The round_start gate ensures bandwidth growth is evaluated once per
+// round trip, not on every ACK. Without this gate, intra-round delivery
+// rate fluctuations would repeatedly reset the counter, preventing Startup
+// from ever detecting a bandwidth plateau.
 func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
 	if bbr.fullBandwidthNow || !bbr.roundStart || rs.isAppLimited || rs.deliveryRate == 0 {
 		return
@@ -1357,7 +1454,19 @@ func (bbr *BBRv3) resetFullBw() {
 	bbr.fullBandwidthNow = false
 }
 
-// checkDrain implements STARTUP->DRAIN->PROBE_BW transitions per RFC §5.3.
+// checkDrain implements STARTUP -> DRAIN -> ProbeBW state transitions.
+// Per RFC §5.3.2 (Drain):
+//
+// When full_bw_reached becomes true, Startup has filled the pipe and
+// potentially created a queue of up to (cwnd_gain - 1) * BDP ≈ 1 * BDP.
+// Drain state aims to quickly drain this queue by using pacing_gain = 0.5.
+//
+// Exit conditions (RFC §5.3.2 BBRCheckDrainDone):
+//   1. Normal exit: C.inflight <= BDP (queue drained)
+//   2. Fallback exit: round_count > drain_start_round + 3 (bandwidth overestimated)
+//
+// The fallback handles Startup bandwidth overestimation due to competing flows.
+// After 3 rounds, the max_bw filter will advance during the next probing cycle.
 func (bbr *BBRv3) checkDrain(rs bbrRateSample, now monotime.Time) {
 	if bbr.state == BBRStartup && bbr.fullBandwidthReached {
 		bbr.state = BBRDrain
@@ -1376,6 +1485,21 @@ func (bbr *BBRv3) checkDrain(rs bbrRateSample, now monotime.Time) {
 }
 
 // updateCyclePhase implements ProbeBW phase cycling per RFC §5.3.3.
+//
+// ProbeBW uses a four-phase cycle: DOWN -> CRUISE -> REFILL -> UP -> DOWN
+// Each phase serves a specific purpose in the steady-state algorithm:
+//
+//   DOWN (§5.3.3.1):   Decelerate (pacing_gain=0.90) to drain any queue built
+//                      during UP, leave headroom for other flows.
+//
+//   CRUISE (§5.3.3.2): Match sending rate to delivery rate (pacing_gain=1.0),
+//                      respond to loss/ECN by reducing bw_shortterm/inflight_shortterm.
+//
+//   REFILL (§5.3.3.3): Reset short-term model, refill pipe at pacing_gain=1.0
+//                      for one round to avoid premature loss when probing.
+//
+//   UP (§5.3.3.4):     Probe for bandwidth (pacing_gain=1.25, cwnd_gain=2.25),
+//                      exit on full_bw_now or loss rate > 2%.
 func (bbr *BBRv3) updateCyclePhase(rs bbrRateSample, now monotime.Time) {
 	if !bbr.fullBandwidthReached {
 		return
@@ -1614,6 +1738,22 @@ func (bbr *BBRv3) pickProbeWait() {
 }
 
 // updateMinRTT implements min_rtt tracking and ProbeRTT state per RFC §5.3.4.
+//
+// BBR maintains two RTT filters with different time scales (§2.13):
+//   1. probe_rtt_min_delay: 5-second filter for ProbeRTT scheduling
+//   2. min_rtt: 10-second filter for BDP estimation
+//
+// When probe_rtt_min_delay expires without refresh (from idle or lower sample),
+// BBR enters ProbeRTT state to cooperatively drain the queue with other BBR flows.
+//
+// ProbeRTT algorithm (§5.3.4.3 BBRUpdateMinRTT/BBRCheckProbeRTT):
+//   1. Entry: probe_rtt_expired && !idle_restart && state != ProbeRTT
+//   2. Reduce cwnd to ProbeRTTCwndGain * BDP (0.5 * BDP)
+//   3. Wait for: C.inflight <= probeRTTCwnd AND 200ms AND one round
+//   4. Exit to ProbeBW (if full_bw_reached) or Startup
+//
+// Per §5.3.4.3, this uses the per-event RTT from pendingNewestSentTime,
+// not the potentially stale rttStats.LatestRTT().
 func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
 	// Per draft-ietf-ccwg-bbr-05 §5.3.4.3, use the RTT from the current ACK event,
 	// not LatestRTT which may be stale if this ACK didn't update rttStats.
@@ -1795,7 +1935,19 @@ func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.Pac
 	}
 }
 
-// isInflightTooHigh checks for loss/ECN threshold violations per RFC §2.7.
+// isInflightTooHigh checks for congestion signal threshold violations.
+// Per RFC §2.7 (Core Algorithm Design Parameters):
+//
+// Loss threshold: BBR.LossThresh = 2%
+//   If RS.lost / RS.tx_in_flight > 2%, inflight is too high
+//
+// ECN threshold (tcp_bbr.c, not RFC-specified): ECN_THRESH = 50%
+//   If RS.delivered_ce / RS.delivered > 50%, inflight is too high
+//
+// These thresholds balance responsiveness to congestion against robustness
+// to transient noise. The 2% loss threshold allows BBR to tolerate moderate
+// random loss (e.g., from shallow buffers) while still detecting persistent
+// overload. The 50% ECN threshold is aggressive because ECN is an early signal.
 func (bbr *BBRv3) isInflightTooHigh(rs bbrRateSample) bool {
 	if rs.txInFlight > 0 && rs.lost > 0 {
 		if float64(rs.lost) > float64(rs.txInFlight)*LOSS_THRESH {
@@ -1831,6 +1983,20 @@ func (bbr *BBRv3) inflightHiFromLostPacket(rs bbrRateSample, lostPacketSize prot
 }
 
 // updateGains sets pacing and cwnd gains based on current state.
+// Per RFC §5.6.1 (Summary of Control Behavior in the State Machine):
+//
+// State/Phase       pacing_gain  cwnd_gain
+// ─────────────────────────────────────────
+// Startup           2.77         2.0
+// Drain             0.50         2.0
+// ProbeBW_DOWN      0.90         2.0
+// ProbeBW_CRUISE    1.0          2.0
+// ProbeBW_REFILL    1.0          2.0
+// ProbeBW_UP        1.25         2.25
+// ProbeRTT          1.0          0.5
+//
+// pacing_gain controls sending rate relative to BBR.bw.
+// cwnd_gain controls max inflight relative to BDP.
 func (bbr *BBRv3) updateGains() {
 	switch bbr.state {
 	case BBRStartup:
@@ -1938,15 +2104,20 @@ func (bbr *BBRv3) targetCwnd(gain float64) protocol.ByteCount {
 	return inflight
 }
 
-// maxInflight implements BBRUpdateMaxInflight() per draft-05 §5.6.4.2:
+// maxInflight implements BBRUpdateMaxInflight() per RFC §5.6.4.2:
 //
-//	inflight_cap = BBRBDPMultiple(BBR.cwnd_gain)
-//	inflight_cap += BBR.extra_acked
-//	BBR.max_inflight = BBRQuantizationBudget(inflight_cap)
+//	inflight_cap = BBRBDPMultiple(BBR.cwnd_gain)  // BDP * cwnd_gain
+//	inflight_cap += BBR.extra_acked               // add aggregation headroom
+//	BBR.max_inflight = BBRQuantizationBudget(inflight_cap)  // apply floors
 //
-// The key difference from targetCwnd is that extra_acked is added BEFORE
-// quantization, not after. This ensures the quantization floor (offload_budget,
-// min_pipe_cwnd, probe headroom) is applied to the sum of BDP and extra_acked.
+// This is the target cwnd for steady-state operation. The algorithm:
+//   1. Compute BDP-based inflight with cwnd_gain multiplier
+//   2. Add extra_acked to accommodate ACK aggregation (§5.5.9)
+//   3. Apply quantization budget (§5.6.4.2): max(inflight, offload_budget, minPipeCwnd)
+//
+// CRITICAL: extra_acked is added BEFORE quantization, not after.
+// This ensures quantization floors apply to the sum of BDP and aggregation
+// headroom, matching the RFC pseudocode exactly.
 func (bbr *BBRv3) maxInflight() protocol.ByteCount {
 	inflight := bbr.inflightFromBWGain(bbr.boundedBandwidth(), bbr.cwndGain)
 	if bbr.fullBandwidthReached {

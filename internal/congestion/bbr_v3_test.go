@@ -105,8 +105,8 @@ func TestBBRv3PerPacketStateCapture(t *testing.T) {
 }
 
 // TestBBRv3RateSampleContract verifies that rate sample fields are
-// correctly computed from per-packet state per RFC §4.2.
-// AGENTIC GUARDRAIL: RFC §4.2 REQUIRES these rate sample fields be computed on ACK.
+// correctly computed from per-packet state per RFC §4.1.2.3 (Upon receiving an ACK).
+// AGENTIC GUARDRAIL: RFC §4.1.2.3 REQUIRES these rate sample fields be computed on ACK.
 func TestBBRv3RateSampleContract(t *testing.T) {
 	bbr := newTestBBRv3()
 	sendTime := monotime.Now()
@@ -362,8 +362,8 @@ func TestBBRv3ConnectionMigrationResetsControllerState(t *testing.T) {
 }
 
 // TestBBRv3IdleRestartPacingReset verifies that sending from idle
-// (priorInFlight == 0) resets pacing rate in ProbeBW per RFC §5.4.
-// AGENTIC GUARDRAIL: RFC §5.4 REQUIRES idle restart refresh pacing.
+// (priorInFlight == 0) resets pacing rate in ProbeBW per RFC §5.4.1.
+// AGENTIC GUARDRAIL: RFC §5.4.1 REQUIRES idle restart to refresh pacing rate.
 func TestBBRv3IdleRestartPacingReset(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -399,8 +399,9 @@ func TestBBRv3IdleRestartPacingReset(t *testing.T) {
 }
 
 // TestBBRv3IdleRestartPreservesCwnd verifies that cwnd is not reduced
-// during idle restart per RFC §5.4.
-// AGENTIC GUARDRAIL: RFC §5.4 REQUIRES cwnd be preserved through idle.
+// during idle restart per RFC §5.4.1.
+// AGENTIC GUARDRAIL: RFC §5.4.1: "When restarting from idle...BBR leaves
+// C.cwnd as-is" to allow immediate burst to refill the pipe.
 func TestBBRv3IdleRestartPreservesCwnd(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -433,8 +434,10 @@ func TestBBRv3IdleRestartPreservesCwnd(t *testing.T) {
 }
 
 // TestBBRv3IdleRestartFlagLifecycle verifies the idleRestart flag is
-// set on idle send and cleared after first ACK processing per RFC §5.4.
-// AGENTIC GUARDRAIL: RFC §5.4 specifies flag lifecycle for ProbeRTT suppression.
+// set on idle send and cleared after first ACK processing per RFC §5.4.1.
+// AGENTIC GUARDRAIL: RFC §5.4.1: idle_restart suppresses ProbeRTT entry
+// because "the idleness is deemed a sufficient attempt to coordinate to
+// drain the queue" (§5.3.4.2).
 func TestBBRv3IdleRestartFlagLifecycle(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
@@ -635,10 +638,18 @@ func TestBBRv3CwndQuantizationFloor(t *testing.T) {
 
 // ============================================================================
 // ECN RESPONSE (tcp_bbr.c-aligned)
-// RFC §3.7: "This draft does not specify a specific response to ECN."
-// IMPLEMENTATION CHOICE: We follow Google's tcp_bbr.c approach:
-//   - EWMA ecn_alpha with gain = 1/16
-//   - inflightLo *= (1 - ecn_alpha * 1/3) on ECN-in-round
+//
+// RFC §3.7 (ECN): "This experimental version of BBR does not specify a
+// specific response to Classic [RFC3168], Alternative Backoff with ECN
+// (ABE) [RFC8511] or L4S [RFC9330] style ECN."
+//
+// IMPLEMENTATION CHOICE: We follow Google's tcp_bbr.c v3 approach:
+//   - Track ECN marking ratio via EWMA with gain = 1/16 (ECN_ALPHA_GAIN)
+//   - Reduce inflightLo by (ecn_alpha * ECN_FACTOR) where ECN_FACTOR = 1/3
+//   - ECN only eligible on low-RTT paths (minRTT <= ECN_MAX_RTT = 5ms)
+//
+// These tests are NOT RFC compliance tests - they enforce our chosen
+// tcp_bbr.c-aligned implementation strategy where the RFC grants discretion.
 // ============================================================================
 
 // TestBBRv3ECNAlphaCalculation verifies the EWMA formula for ecnAlpha.
