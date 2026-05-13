@@ -440,11 +440,10 @@ type BBRv3 struct {
 
 	lossRoundDelivered      uint64
 	lossRoundStart          bool
-	lossInRound             bool
-	ecnInRound              bool
-	lossInCycle             bool
-	ecnInCycle              bool
-	lossEventsInRound       int
+	lossInRound       bool
+	ecnInRound        bool
+	lossInCycle       bool
+	lossEventsInRound int
 	lossEventCountedThisACK bool // Ensures we count at most one loss event per ACK event
 	bytesLostInRound        protocol.ByteCount
 
@@ -682,10 +681,22 @@ func (bbr *BBRv3) OnPacketSent(
 	if bytesInFlight > bytes {
 		priorInFlight = bytesInFlight - bytes
 	}
+	// When nothing is in flight, initialize the delivery sampler timestamps.
+	// This is needed for correct delivery rate calculation on first send and
+	// after the pipe drains completely.
 	if priorInFlight == 0 {
 		bbr.firstSentTime = sentTime
 		bbr.deliveredTime = sentTime
+	}
+	// RFC §5.4.1: idle restart requires BOTH zero inflight AND app-limited.
+	// The app-limited condition distinguishes true idle (no data to send) from
+	// transient zero-inflight (e.g., loss recovery draining the pipe).
+	if priorInFlight == 0 && bbr.appLimitedUntil != 0 {
 		bbr.idleRestart = true
+		// RFC §5.4.1: reset ACK aggregation interval on idle restart.
+		// Stale ackEpochStart from before idle would skew extra_acked calculation.
+		bbr.ackEpochStart = sentTime
+		bbr.ackEpochAcked = 0
 		if bbr.state == BBRProbeBW {
 			bbr.setPacingRateWithGain(1.0)
 		} else if bbr.state == BBRProbeRTT {
@@ -1046,6 +1057,13 @@ func (bbr *BBRv3) OnECNFeedback(
 	if bbr.minRTT <= 0 || (ECN_MAX_RTT != 0 && bbr.minRTT > ECN_MAX_RTT) {
 		return // Don't store pendingECNCEBytes before eligibility
 	}
+	// On eligibility transition: seed alpha baseline from current totals.
+	// Without this, the first CE ratio would be diluted by historical bytes
+	// delivered before ECN feedback was trustworthy.
+	if !bbr.ecnEligible {
+		bbr.alphaLastDelivered = bbr.totalBytesAcked
+		bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
+	}
 	bbr.ecnEligible = true
 
 	ceBytes := protocol.ByteCount(uint64(ackedBytes) * uint64(ceDelta) / uint64(max(total, int64(1))))
@@ -1394,6 +1412,12 @@ func (bbr *BBRv3) checkLossTooHighInStartup(rs bbrRateSample) {
 	if bbr.fullBandwidthReached {
 		return
 	}
+	// State-gate: this estimator only applies to Startup. ProbeRTT can be entered
+	// before fullBandwidthReached (via probe_rtt_interval expiry), and loss during
+	// ProbeRTT's reduced cwnd must not trigger Startup's high-loss exit.
+	if bbr.state != BBRStartup {
+		return
+	}
 	if bbr.lossRoundStart && bbr.lossEventsInRound >= STARTUP_FULL_LOSS_COUNT {
 		s := rs
 		s.lost = bbr.bytesLostInRound
@@ -1431,7 +1455,15 @@ func (bbr *BBRv3) handleQueueTooHighInStartup() {
 // round trip, not on every ACK. Without this gate, intra-round delivery
 // rate fluctuations would repeatedly reset the counter, preventing Startup
 // from ever detecting a bandwidth plateau.
+//
+// State-gate: this estimator only applies to Startup. ProbeRTT can be entered
+// before fullBandwidthReached (via probe_rtt_interval expiry), and the reduced
+// cwnd would cause spurious bandwidth plateaus. ProbeBW_UP has its own plateau
+// detection in updateCyclePhase().
 func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
+	if bbr.state != BBRStartup {
+		return
+	}
 	if bbr.fullBandwidthNow || !bbr.roundStart || rs.isAppLimited || rs.deliveryRate == 0 {
 		return
 	}
@@ -2232,7 +2264,11 @@ func (bbr *BBRv3) resetCongestionSignals() {
 	bbr.lossInRound = false
 	bbr.ecnInRound = false
 	bbr.lossInCycle = false
-	bbr.ecnInCycle = false
+	// Note: tcp_bbr.c tracks ecnInCycle for faster re-probing after ECN-only
+	// congestion clears (shorter probe_wait when !lossInCycle && ecnInCycle).
+	// This optimization is not implemented because RFC §3.7 leaves ECN response
+	// unspecified, and the current ecnInRound-based inflightLo adaptation is
+	// sufficient for congestion response. Future work could add this if needed.
 	bbr.bwLatest = 0
 	bbr.inflightLatest = 0
 	bbr.bytesLostInRound = 0
