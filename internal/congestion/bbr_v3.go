@@ -145,9 +145,13 @@ const (
 	//
 	// This approach is tested in bbr_v3_test.go Part 2 (Implementation Strategy Tests).
 
-	// ECN_ALPHA_GAIN is the EWMA smoothing factor for ecn_alpha.
+	// ECN_ALPHA_UNIT is the fixed-point scale for ecnAlpha, matching BBR_UNIT
+	// naming convention from tcp_bbr.c. ecnAlpha / ECN_ALPHA_UNIT gives [0, 1].
+	ECN_ALPHA_UNIT = 1 << 16
+
+	// ECN_ALPHA_GAIN_SHIFT implements g=1/16 via bit-shift for the EWMA.
 	// Source: tcp_bbr.c bbr_ecn_alpha_gain = BBR_UNIT / 16
-	ECN_ALPHA_GAIN = 1.0 / 16.0
+	ECN_ALPHA_GAIN_SHIFT = 4
 
 	// ECN_FACTOR is the inflightLo reduction multiplier.
 	// Source: tcp_bbr.c bbr_ecn_factor = BBR_UNIT / 3
@@ -460,7 +464,7 @@ type BBRv3 struct {
 
 	alphaLastDelivered   uint64
 	alphaLastDeliveredCE uint64
-	ecnAlpha             float64
+	ecnAlpha             uint32 // fixed-point alpha scaled by ECN_ALPHA_UNIT
 	ecnEligible          bool
 
 	minRTT            time.Duration
@@ -615,7 +619,7 @@ func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount
 	bbr.bwLo = protocol.MaxByteCount
 	bbr.inflightHi = protocol.MaxByteCount
 	bbr.inflightLo = protocol.MaxByteCount
-	bbr.ecnAlpha = 1.0
+	bbr.ecnAlpha = ECN_ALPHA_UNIT
 	bbr.sentPackets = make(map[protocol.PacketNumber]bbrSentPacketState)
 	bbr.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	bbr.lastState = BBRStartup
@@ -1222,48 +1226,51 @@ func (bbr *BBRv3) updateRoundStart(rs bbrRateSample) {
 	bbr.nextRoundDelivered = bbr.totalBytesAcked
 }
 
-// updateECNAlpha updates the ECN alpha EWMA.
+// updateECNAlpha updates the ECN alpha EWMA using fixed-point bit-shift arithmetic.
 // This is an IMPLEMENTATION CHOICE following tcp_bbr.c bbr_update_ecn_alpha().
 // The RFC does not mandate this formula - see §3.7.
 func (bbr *BBRv3) updateECNAlpha(_ bbrRateSample) {
 	if !bbr.roundStart || !bbr.ecnEligible {
 		return
 	}
-	// ECN alpha EWMA: alpha = (1-g)*alpha + g*ce_ratio, with g=1/16.
-	delivered := float64(bbr.totalBytesAcked - bbr.alphaLastDelivered)
-	deliveredCE := float64(bbr.totalBytesAckedCE - bbr.alphaLastDeliveredCE)
-	if delivered <= 0 {
+	delivered := bbr.totalBytesAcked - bbr.alphaLastDelivered
+	deliveredCE := bbr.totalBytesAckedCE - bbr.alphaLastDeliveredCE
+	if delivered == 0 {
 		return
 	}
-	ceRatio := deliveredCE / delivered
-	if ceRatio < 0 {
-		ceRatio = 0
+	// ceRatioScaled is CE ratio in fixed-point [0, ECN_ALPHA_UNIT].
+	ceRatioScaled := uint32(deliveredCE * ECN_ALPHA_UNIT / delivered)
+	if ceRatioScaled > ECN_ALPHA_UNIT {
+		ceRatioScaled = ECN_ALPHA_UNIT
 	}
-	if ceRatio > 1 {
-		ceRatio = 1
-	}
+	// EWMA: alpha = alpha - (alpha >> 4) + (ceRatio >> 4), i.e. g = 1/16.
 	oldAlpha := bbr.ecnAlpha
-	bbr.ecnAlpha = (1.0-ECN_ALPHA_GAIN)*bbr.ecnAlpha + ECN_ALPHA_GAIN*ceRatio
-	if bbr.ecnAlpha < 0 {
-		bbr.ecnAlpha = 0
-	}
-	if bbr.ecnAlpha > 1 {
-		bbr.ecnAlpha = 1
+	bbr.ecnAlpha = bbr.ecnAlpha - (bbr.ecnAlpha >> ECN_ALPHA_GAIN_SHIFT) + (ceRatioScaled >> ECN_ALPHA_GAIN_SHIFT)
+	if bbr.ecnAlpha > ECN_ALPHA_UNIT {
+		bbr.ecnAlpha = ECN_ALPHA_UNIT
 	}
 	bbr.alphaLastDelivered = bbr.totalBytesAcked
 	bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
 
-	// Qlog ECN update if alpha changed significantly
-	if bbr.qlogger != nil && (oldAlpha == 1.0 || math.Abs(bbr.ecnAlpha-oldAlpha) > 0.01) {
+	// Qlog ECN update if alpha changed significantly (threshold ~1% of full scale)
+	alphaThresh := uint32(ECN_ALPHA_UNIT / 100)
+	var diff uint32
+	if bbr.ecnAlpha > oldAlpha {
+		diff = bbr.ecnAlpha - oldAlpha
+	} else {
+		diff = oldAlpha - bbr.ecnAlpha
+	}
+	if bbr.qlogger != nil && (oldAlpha == ECN_ALPHA_UNIT || diff > alphaThresh) {
 		bbr.qlogger.RecordEvent(qlog.BBRv3ECNUpdated{
-			ECNAlpha:    bbr.ecnAlpha,
+			ECNAlpha:    float64(bbr.ecnAlpha) / float64(ECN_ALPHA_UNIT),
 			ECNEligible: bbr.ecnEligible,
 		})
 	}
 
 	// Check for excessive ECN in startup per tcp_bbr.c
+	ceRatioFloat := float64(ceRatioScaled) / float64(ECN_ALPHA_UNIT)
 	if bbr.state == BBRStartup && !bbr.fullBandwidthReached {
-		if ceRatio >= ECN_THRESH {
+		if ceRatioFloat >= ECN_THRESH {
 			bbr.startupECNRounds++
 		} else {
 			bbr.startupECNRounds = 0
@@ -1342,7 +1349,8 @@ func (bbr *BBRv3) adaptLowerBounds(bbrRateSample) {
 	ecnInflightLo := protocol.MaxByteCount
 	if bbr.ecnInRound && ECN_FACTOR > 0 {
 		bbr.initLowerBounds(false)
-		ecnInflightLo = protocol.ByteCount(float64(bbr.inflightLo) * (1.0 - bbr.ecnAlpha*ECN_FACTOR))
+		alphaFloat := float64(bbr.ecnAlpha) / float64(ECN_ALPHA_UNIT)
+		ecnInflightLo = protocol.ByteCount(float64(bbr.inflightLo) * (1.0 - alphaFloat*ECN_FACTOR))
 	}
 	if bbr.lossInRound {
 		bbr.initLowerBounds(true)
@@ -2168,6 +2176,12 @@ func (bbr *BBRv3) probeRTTCwnd() protocol.ByteCount {
 	return max(bbr.inflightFromBWGain(bbr.boundedBandwidth(), PROBE_RTT_CWND_GAIN), bbr.minPipeCwnd)
 }
 
+// bwTimeProduct computes bw * duration using microsecond intermediate precision.
+// This pattern prevents uint64 overflow at extreme BDPs (safe to ~14.4 Tbps at any RTT).
+func bwTimeProduct(bw protocol.ByteCount, d time.Duration) protocol.ByteCount {
+	return protocol.ByteCount(uint64(bw) * uint64(d/time.Microsecond) / 1_000_000)
+}
+
 func (bbr *BBRv3) inflightFromBWGain(bw protocol.ByteCount, gain float64) protocol.ByteCount {
 	if bw <= 0 {
 		return max(bbr.initialCwnd, bbr.minPipeCwnd)
@@ -2175,7 +2189,7 @@ func (bbr *BBRv3) inflightFromBWGain(bw protocol.ByteCount, gain float64) protoc
 	if bbr.minRTT <= 0 {
 		return max(bbr.congestionWindow, bbr.minPipeCwnd)
 	}
-	bdp := protocol.ByteCount(uint64(bw) * uint64(bbr.minRTT) / uint64(time.Second))
+	bdp := bwTimeProduct(bw, bbr.minRTT)
 	inflight := protocol.ByteCount(float64(bdp) * gain)
 	return max(inflight, bbr.minPipeCwnd)
 }
@@ -2215,11 +2229,7 @@ func (bbr *BBRv3) updateAckAggregation(rs bbrRateSample, now monotime.Time) {
 		}
 		if bbr.extraAckedWinRTTs >= winThresh {
 			bbr.extraAckedWinRTTs = 0
-			if bbr.extraAckedWinIdx == 0 {
-				bbr.extraAckedWinIdx = 1
-			} else {
-				bbr.extraAckedWinIdx = 0
-			}
+			bbr.extraAckedWinIdx ^= 1
 			bbr.extraAcked[bbr.extraAckedWinIdx] = 0
 		}
 	}
@@ -2227,11 +2237,13 @@ func (bbr *BBRv3) updateAckAggregation(rs bbrRateSample, now monotime.Time) {
 	epoch := now.Sub(bbr.ackEpochStart)
 	expected := protocol.ByteCount(0)
 	if epoch > 0 {
-		expected = protocol.ByteCount(uint64(bbr.boundedBandwidth()) * uint64(epoch) / uint64(time.Second))
+		expected = bwTimeProduct(bbr.boundedBandwidth(), epoch)
 	}
-	// Linux's BBR_ACK_EPOCH_ACKED_MAX = (1<<20) - 1 is a 20-bit *packet* count.
-	// quic-go's ackEpochAcked is a byte count, so we scale the threshold by
-	// maxDatagramSize to keep the time-equivalent guard the same as Linux.
+	// IMPLEMENTATION CHOICE: The RFC does not specify a saturation guard for the
+	// ack epoch counter. Linux tcp_bbr.c uses BBR_ACK_EPOCH_ACKED_MAX = (1<<20) - 1
+	// (~1M packets) to prevent overflow. We follow this approach as a safe default,
+	// scaling by maxDatagramSize since quic-go tracks bytes rather than packets.
+	// This could be tuned or removed without affecting RFC compliance.
 	resetThresh := protocol.ByteCount(1<<20) * bbr.maxDatagramSize
 	satCap := max(resetThresh-1, 0)
 
@@ -2252,7 +2264,7 @@ func (bbr *BBRv3) maxExtraAcked() protocol.ByteCount {
 	v := max(bbr.extraAcked[0], bbr.extraAcked[1])
 	cap := protocol.ByteCount(0)
 	if bbr.boundedBandwidth() > 0 {
-		cap = protocol.ByteCount(uint64(bbr.boundedBandwidth()) * uint64(EXTRA_ACKED_MAX_US) / uint64(time.Second))
+		cap = bwTimeProduct(bbr.boundedBandwidth(), EXTRA_ACKED_MAX_US)
 	}
 	if cap > 0 {
 		v = min(v, cap)

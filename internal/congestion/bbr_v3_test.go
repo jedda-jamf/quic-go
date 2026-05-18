@@ -41,6 +41,16 @@ func (r *recordingQlogger) RecordEvent(ev qlogwriter.Event) {
 
 func (r *recordingQlogger) Close() error { return nil }
 
+// ecnAlphaFromFloat converts a float64 alpha [0,1] to scaled uint32.
+func ecnAlphaFromFloat(f float64) uint32 {
+	return uint32(f * ECN_ALPHA_UNIT)
+}
+
+// ecnAlphaToFloat converts a scaled uint32 alpha to float64 [0,1].
+func ecnAlphaToFloat(a uint32) float64 {
+	return float64(a) / float64(ECN_ALPHA_UNIT)
+}
+
 // setupProbeBWPhase configures BBR in a specific ProbeBW phase
 func setupProbeBWPhase(bbr *BBRv3, phase bbrProbeBWPhase) {
 	bbr.state = BBRProbeBW
@@ -301,7 +311,7 @@ func TestBBRv3ConnectionMigrationResetsControllerState(t *testing.T) {
 	bbr.totalBytesAcked = 456
 	bbr.totalBytesLost = 789
 	bbr.totalBytesAckedCE = 321
-	bbr.ecnAlpha = 0.25
+	bbr.ecnAlpha = ecnAlphaFromFloat(0.25)
 	bbr.priorCwnd = 777
 	bbr.idleRestart = true
 	bbr.ptoRecovery = true
@@ -343,7 +353,7 @@ func TestBBRv3ConnectionMigrationResetsControllerState(t *testing.T) {
 	require.Zero(t, bbr.totalBytesAcked)
 	require.Zero(t, bbr.totalBytesLost)
 	require.Zero(t, bbr.totalBytesAckedCE)
-	require.Equal(t, 1.0, bbr.ecnAlpha)
+	require.Equal(t, uint32(ECN_ALPHA_UNIT), bbr.ecnAlpha)
 	require.Zero(t, bbr.priorCwnd)
 	require.False(t, bbr.idleRestart)
 	require.False(t, bbr.ptoRecovery)
@@ -738,7 +748,7 @@ func TestBBRv3ECNAlphaCalculation(t *testing.T) {
 			bbr := newTestBBRv3()
 			bbr.ecnEligible = true
 			bbr.minRTT = 3 * time.Millisecond // Enable ECN
-			bbr.ecnAlpha = tc.initialAlpha
+			bbr.ecnAlpha = ecnAlphaFromFloat(tc.initialAlpha)
 			bbr.alphaLastDelivered = 0
 			bbr.alphaLastDeliveredCE = 0
 			bbr.totalBytesAcked = tc.ackedBytes
@@ -748,7 +758,7 @@ func TestBBRv3ECNAlphaCalculation(t *testing.T) {
 			bbr.roundStart = true
 			bbr.updateECNAlpha(bbrRateSample{})
 
-			require.InDelta(t, tc.expectedAlpha, bbr.ecnAlpha, tc.tolerance,
+			require.InDelta(t, tc.expectedAlpha, ecnAlphaToFloat(bbr.ecnAlpha), tc.tolerance,
 				"ecnAlpha should match expected value")
 		})
 	}
@@ -770,13 +780,13 @@ func TestBBRv3ECNAlphaBounds(t *testing.T) {
 		bbr.roundStart = true
 		bbr.updateECNAlpha(bbrRateSample{})
 	}
-	require.LessOrEqual(t, bbr.ecnAlpha, 1.0,
+	require.LessOrEqual(t, ecnAlphaToFloat(bbr.ecnAlpha), 1.0,
 		"ecnAlpha should not exceed 1.0")
-	require.GreaterOrEqual(t, bbr.ecnAlpha, 0.9,
+	require.GreaterOrEqual(t, ecnAlphaToFloat(bbr.ecnAlpha), 0.9,
 		"ecnAlpha should approach 1.0 with 100% CE")
 
 	// 0% CE marking
-	bbr.ecnAlpha = 0.5
+	bbr.ecnAlpha = ecnAlphaFromFloat(0.5)
 	for i := 0; i < 100; i++ {
 		bbr.alphaLastDelivered = bbr.totalBytesAcked
 		bbr.alphaLastDeliveredCE = bbr.totalBytesAckedCE
@@ -785,9 +795,9 @@ func TestBBRv3ECNAlphaBounds(t *testing.T) {
 		bbr.roundStart = true
 		bbr.updateECNAlpha(bbrRateSample{})
 	}
-	require.GreaterOrEqual(t, bbr.ecnAlpha, 0.0,
+	require.GreaterOrEqual(t, ecnAlphaToFloat(bbr.ecnAlpha), 0.0,
 		"ecnAlpha should not go below 0.0")
-	require.LessOrEqual(t, bbr.ecnAlpha, 0.1,
+	require.LessOrEqual(t, ecnAlphaToFloat(bbr.ecnAlpha), 0.1,
 		"ecnAlpha should approach 0.0 with 0% CE")
 }
 
@@ -797,7 +807,7 @@ func TestBBRv3ECNAlphaConvergence(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.ecnEligible = true
 	bbr.minRTT = 3 * time.Millisecond
-	bbr.ecnAlpha = 0.0
+	bbr.ecnAlpha = 0
 
 	// Sustained 50% CE marking
 	for i := 0; i < 200; i++ {
@@ -809,7 +819,7 @@ func TestBBRv3ECNAlphaConvergence(t *testing.T) {
 		bbr.updateECNAlpha(bbrRateSample{})
 	}
 
-	require.InDelta(t, 0.5, bbr.ecnAlpha, 0.05,
+	require.InDelta(t, 0.5, ecnAlphaToFloat(bbr.ecnAlpha), 0.05,
 		"ecnAlpha should converge to ~0.5 with sustained 50% CE")
 }
 
@@ -820,7 +830,7 @@ func TestBBRv3ECNAlphaReducesInflightLo(t *testing.T) {
 	bbr := newTestBBRv3()
 	setupProbeBWPhase(bbr, probeBWCruise)
 	bbr.ecnEligible = true
-	bbr.ecnAlpha = 0.5
+	bbr.ecnAlpha = ecnAlphaFromFloat(0.5)
 	bbr.inflightLo = 100_000
 	bbr.inflightLatest = 50_000
 	bbr.ecnInRound = true
@@ -851,7 +861,7 @@ func TestBBRv3ECNEventPath(t *testing.T) {
 	setupProbeBWPhase(bbr, probeBWCruise)
 	bbr.minRTT = 3 * time.Millisecond // Enable ECN eligibility (must be <= ECN_MAX_RTT=5ms)
 	bbr.ecnEligible = true
-	bbr.ecnAlpha = 0.0
+	bbr.ecnAlpha = 0
 	bbr.inflightLo = 100_000
 
 	// Set up round boundary so round_start will be triggered in updateRoundStart
@@ -903,7 +913,7 @@ func TestBBRv3ECNEventPath(t *testing.T) {
 	// 3. ecnAlpha should have moved from 0 toward the CE ratio
 	// With 60% CE (3/5), after one EWMA update with g=1/16:
 	// alpha = (15/16)*0 + (1/16)*0.6 = 0.0375
-	require.Greater(t, bbr.ecnAlpha, 0.0,
+	require.Greater(t, bbr.ecnAlpha, uint32(0),
 		"ecnAlpha MUST increase when CE marks received through event path")
 }
 
@@ -939,7 +949,7 @@ func TestBBRv3ProbeBWCruiseECNReducesInflightLo(t *testing.T) {
 	bbr.bwLo = 1_000_000
 	bbr.inflightLo = 100_000
 	bbr.inflightLatest = 50_000
-	bbr.ecnAlpha = 0.5
+	bbr.ecnAlpha = ecnAlphaFromFloat(0.5)
 	bbr.ecnInRound = true
 	bbr.lossInRound = false
 	bbr.lossRoundStart = true
@@ -2078,7 +2088,7 @@ func TestBBRv3UpperAndLowerBoundAdaptation(t *testing.T) {
 
 	bbr.lossInRound = false
 	bbr.ecnInRound = true
-	bbr.ecnAlpha = 0.6
+	bbr.ecnAlpha = ecnAlphaFromFloat(0.6)
 	bbr.inflightLo = 30_000
 	bbr.adaptLowerBounds(bbrRateSample{})
 	require.Equal(t, protocol.ByteCount(24_000), bbr.inflightLo)
@@ -2396,10 +2406,10 @@ func TestBBRv3ECNAlphaBaselineSeedOnEligibility(t *testing.T) {
 	bbr.updateECNAlpha(bbrRateSample{})
 
 	// The CE ratio should be ~50% (5000/10000), NOT ~9% (10000/110000)
-	// ECN_ALPHA_GAIN = 1/16 = 0.0625, so alpha = 0.9375*1.0 + 0.0625*0.5 ≈ 0.97
-	// But since this is the first update, we're moving from alpha=1.0 toward 0.5
-	expectedAlpha := (1.0-ECN_ALPHA_GAIN)*1.0 + ECN_ALPHA_GAIN*0.5
-	require.InDelta(t, expectedAlpha, bbr.ecnAlpha, 0.01,
+	// With g=1/16 bit-shift EWMA: alpha = alpha - (alpha >> 4) + (ceRatio >> 4)
+	// Starting from alpha=1.0: alpha = 1.0 - 0.0625 + 0.03125 ≈ 0.97
+	expectedAlpha := 1.0 - (1.0 / 16.0) + (0.5 / 16.0)
+	require.InDelta(t, expectedAlpha, ecnAlphaToFloat(bbr.ecnAlpha), 0.01,
 		"ECN alpha should reflect only post-eligibility CE ratio, not lifetime")
 }
 
