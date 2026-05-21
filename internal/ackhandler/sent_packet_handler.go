@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -172,12 +173,15 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
-	// Log effective packet reordering threshold at startup
+	// Log effective packet reordering threshold at startup (unconditionally to stderr for diagnostics)
 	reorderThreshold := protocol.PacketNumber(packetThreshold)
+	implementsInterface := false
 	if pth, ok := cc.(congestion.PacketReorderingThresholdProvider); ok {
 		reorderThreshold = pth.GetPacketReorderThreshold()
+		implementsInterface = true
 	}
-	logger.Infof("sent_packet_handler: packet_reorder_threshold=%d (default=%d)", reorderThreshold, packetThreshold)
+	fmt.Fprintf(os.Stderr, "[quic-go] sent_packet_handler: packet_reorder_threshold=%d (default=%d, interface_detected=%v, cc_type=%T)\n",
+		reorderThreshold, packetThreshold, implementsInterface, cc)
 	return h
 }
 
