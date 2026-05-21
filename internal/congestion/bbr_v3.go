@@ -235,9 +235,8 @@ const (
 	// packetReorderingThreshold overrides the default RFC 9002 kPacketThreshold (3)
 	// for loss detection. Higher values tolerate more reordering before declaring
 	// loss, reducing false positives on paths with intentional or natural reordering.
-	// A value of 10 allows packets to arrive up to 10 positions out of order before
-	// being considered lost via the packet threshold mechanism.
-	packetReorderingThreshold = 10
+	// DEBUG: Set to 1000 to verify interface is working — should see zero reorder-triggered losses.
+	packetReorderingThreshold = 1000
 )
 
 // bbrProbeBWPhase represents the sub-phases within ProbeBW state.
