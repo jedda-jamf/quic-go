@@ -172,6 +172,12 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
+	// Log effective packet reordering threshold at startup
+	reorderThreshold := protocol.PacketNumber(packetThreshold)
+	if pth, ok := cc.(congestion.PacketReorderingThresholdProvider); ok {
+		reorderThreshold = pth.GetPacketReorderThreshold()
+	}
+	logger.Infof("sent_packet_handler: packet_reorder_threshold=%d (default=%d)", reorderThreshold, packetThreshold)
 	return h
 }
 
