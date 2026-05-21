@@ -2728,6 +2728,15 @@ func TestBBRv3PhaseString(t *testing.T) {
 	require.Equal(t, "unknown", bbrProbeBWPhase(99).String())
 }
 
+func TestBBRv3PacketReorderingThreshold(t *testing.T) {
+	bbr := newTestBBRv3()
+	// BBRv3-pt uses an elevated packet reordering threshold (10) to tolerate
+	// paths with natural or intentional reordering without false loss declarations.
+	// This reduces unnecessary congestion response on reordering-heavy paths.
+	require.Equal(t, protocol.PacketNumber(10), bbr.GetPacketReorderThreshold(),
+		"packetReorderingThreshold should be 10 to tolerate reordering")
+}
+
 func TestBBRv3SpuriousLossRecovery(t *testing.T) {
 	bbr := newTestBBRv3()
 	now := monotime.Now()
