@@ -227,6 +227,17 @@ const (
 	// recover on any spurious loss detection (spuriousCount >= 1). Higher values
 	// can prevent ping-ponging in scenarios with mixed reordering and real loss.
 	spuriousLossRecoveryThreshold = 0
+
+	// ==========================================================================
+	// PACKET REORDERING TOLERANCE
+	// ==========================================================================
+
+	// packetReorderingThreshold overrides the default RFC 9002 kPacketThreshold (3)
+	// for loss detection. Higher values tolerate more reordering before declaring
+	// loss, reducing false positives on paths with intentional or natural reordering.
+	// A value of 10 allows packets to arrive up to 10 positions out of order before
+	// being considered lost via the packet threshold mechanism.
+	packetReorderingThreshold = 10
 )
 
 // bbrProbeBWPhase represents the sub-phases within ProbeBW state.
@@ -560,16 +571,17 @@ type BBRv3 struct {
 }
 
 var (
-	_ SendAlgorithm               = &BBRv3{}
-	_ SendAlgorithmWithRTTStats   = &BBRv3{}
-	_ SendAlgorithmWithDebugInfos = &BBRv3{}
-	_ AckEventHandler             = &BBRv3{}
-	_ LossDetectionHandler        = &BBRv3{}
-	_ ECNFeedbackHandler          = &BBRv3{}
-	_ AppLimitedHandler           = &BBRv3{}
-	_ SpuriousLossHandler         = &BBRv3{}
-	_ PTOHandler                  = &BBRv3{}
-	_ ConnectionMigrationHandler  = &BBRv3{}
+	_ SendAlgorithm                     = &BBRv3{}
+	_ SendAlgorithmWithRTTStats         = &BBRv3{}
+	_ SendAlgorithmWithDebugInfos       = &BBRv3{}
+	_ AckEventHandler                   = &BBRv3{}
+	_ LossDetectionHandler              = &BBRv3{}
+	_ ECNFeedbackHandler                = &BBRv3{}
+	_ AppLimitedHandler                 = &BBRv3{}
+	_ SpuriousLossHandler               = &BBRv3{}
+	_ PTOHandler                        = &BBRv3{}
+	_ ConnectionMigrationHandler        = &BBRv3{}
+	_ PacketReorderingThresholdProvider = &BBRv3{}
 )
 
 // NewBBRV3 creates a new BBRv3 congestion controller.
@@ -595,6 +607,14 @@ func NewBBRV3(
 
 func (bbr *BBRv3) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
 	bbr.resetControllerState(initialMaxDatagramSize, monotime.Now())
+}
+
+// GetPacketReorderThreshold returns the packet reordering threshold for loss detection.
+// This overrides the default RFC 9002 kPacketThreshold (3) to better tolerate paths
+// with natural or intentional packet reordering, reducing false loss declarations
+// that would otherwise trigger unnecessary congestion response.
+func (bbr *BBRv3) GetPacketReorderThreshold() protocol.PacketNumber {
+	return packetReorderingThreshold
 }
 
 func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount, now monotime.Time) {
