@@ -466,9 +466,13 @@ func (bbr *BBRv3) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCoun
 7. `TestThresholdResetOnMigration` - Both thresholds reset on path migration
 8. `TestLossDetectionLatencyAfterReordering` - Real losses still detected after high threshold
 
-### 5.4 Telemetry Requirements
+### 5.4 Telemetry Requirements (Future Work)
+
+> **Note:** Deferred to follow-up observability PR. The core adaptive threshold logic is correct without this telemetry. This section documents what should be added for debugging/analysis once the feature is validated via Pacemaker.
 
 Record both packet-threshold and time-threshold eligibility before the if/else branch in `detectLostPackets()` to understand which threshold is firing. Add counterfactual test with high packet threshold to expose latent time-threshold losses.
+
+**Rationale for deferral:** The telemetry aids debugging but doesn't affect correctness. Pacemaker A/B testing can proceed without it. Once we have production data showing the feature works, we can add observability for fine-tuning.
 
 ---
 
