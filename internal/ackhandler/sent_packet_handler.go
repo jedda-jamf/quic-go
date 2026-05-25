@@ -606,19 +606,25 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
-	var spuriousLosses []protocol.PacketNumber
-	h.lostPackets.All()(func(pn protocol.PacketNumber, sendTime monotime.Time, _ protocol.ByteCount) bool {
+
+	type spuriousInfo struct {
+		pn      protocol.PacketNumber
+		reorder protocol.PacketNumber
+		length  protocol.ByteCount
+	}
+	var spuriousLosses []spuriousInfo
+
+	h.lostPackets.All()(func(pn protocol.PacketNumber, sendTime monotime.Time, length protocol.ByteCount) bool {
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
-			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
 			if ackRangeIdx == 0 {
-				break
+				return true // continue iteration
 			}
 			ackRangeIdx--
 			ackRange = ack.AckRanges[ackRangeIdx]
 		}
 		if pn < ackRange.Smallest {
-			return true // continue to next packet
+			return true // continue
 		}
 		if pn <= ackRange.Largest {
 			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
@@ -634,18 +640,28 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 					TimeReordering:   timeReordering,
 				})
 			}
-			spuriousLosses = append(spuriousLosses, pn)
+			spuriousLosses = append(spuriousLosses, spuriousInfo{
+				pn:      pn,
+				reorder: packetReordering,
+				length:  length,
+			})
 		}
 		return true // continue iteration
 	})
-	for _, pn := range spuriousLosses {
-		h.lostPackets.Delete(pn)
+
+	// Remove from lost tracker
+	for _, info := range spuriousLosses {
+		h.lostPackets.Delete(info.pn)
 	}
+
+	// Update adaptive thresholds
 	if len(spuriousLosses) > 0 {
+		h.updateAdaptiveThresholds(maxPacketReordering, maxTimeReordering)
+
+		// Notify congestion controller
 		if slh, ok := h.congestion.(congestion.SpuriousLossHandler); ok {
-			for _, pn := range spuriousLosses {
-				packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
-				slh.OnSpuriousLossDetected(pn, packetReordering, 0)
+			for _, info := range spuriousLosses {
+				slh.OnSpuriousLossDetected(info.pn, info.reorder, info.length)
 			}
 		}
 	}
@@ -1334,4 +1350,31 @@ func (h *sentPacketHandler) getTimeThreshold() float64 {
 	// QUICHE-style: 1 + (1 >> shift)
 	// shift=2: 1.25, shift=1: 1.5, shift=0: 2.0
 	return 1.0 + (1.0 / float64(uint(1)<<h.reorderingShift))
+}
+
+// updateAdaptiveThresholds grows thresholds based on observed spurious loss.
+//
+// Implementation landscape:
+// - QUICHE: threshold = max(threshold, gap+1), caps at 300
+// - QUICHE: reorderingShift decreases (widens time) on time-based spurious loss
+func (h *sentPacketHandler) updateAdaptiveThresholds(maxPacketReordering protocol.PacketNumber, maxTimeReordering time.Duration) {
+	// Grow packet threshold (QUICHE-style monotonic)
+	if enableMonotonicThresholdGrowth && maxPacketReordering > 0 {
+		newThreshold := min(maxPacketReordering+1, maxAdaptiveReorderingThreshold)
+		if newThreshold > h.adaptiveReorderingThreshold {
+			h.adaptiveReorderingThreshold = newThreshold
+		}
+	}
+
+	// Widen time threshold if needed (QUICHE-style reorderingShift)
+	if enableAdaptiveTimeThreshold && maxTimeReordering > 0 && h.rttStats != nil {
+		maxRTT := max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())
+		for h.reorderingShift > minReorderingShift {
+			currentThreshold := h.getTimeThreshold()
+			if time.Duration(float64(maxRTT)*currentThreshold) >= maxTimeReordering {
+				break
+			}
+			h.reorderingShift--
+		}
+	}
 }
