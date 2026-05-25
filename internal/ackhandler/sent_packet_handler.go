@@ -934,8 +934,8 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	pnSpace.lossTime = 0
 	packetReorderThreshold := h.getPacketReorderingThreshold()
 
-	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(h.getTimeThreshold() * maxRTT)
+	maxRTT := max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())
+	lossDelay := h.getLossDelay(maxRTT)
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)
@@ -1273,6 +1273,7 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
 	h.resetAdaptiveThresholds()
+	h.maxDatagramSize = initialMaxDatagramSize // Update for BDP-scaled threshold on new path
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
 		if !p.isPathProbePacket {
@@ -1354,6 +1355,19 @@ func (h *sentPacketHandler) getTimeThreshold() float64 {
 	return 1.0 + (1.0 / float64(uint(1)<<h.reorderingShift))
 }
 
+// getLossDelay returns the time-based loss delay using QUICHE-style integer shift.
+// Formula: rtt + (rtt >> shift)
+// This is mathematically equivalent to getTimeThreshold() * rtt but uses exact
+// integer bit shifting as specified.
+func (h *sentPacketHandler) getLossDelay(maxRTT time.Duration) time.Duration {
+	if !enableAdaptiveTimeThreshold {
+		// RFC 9002 default: 9/8 * RTT
+		return maxRTT * 9 / 8
+	}
+	// QUICHE-style: rtt + (rtt >> shift)
+	return maxRTT + (maxRTT >> h.reorderingShift)
+}
+
 // updateAdaptiveThresholds grows thresholds based on observed spurious loss.
 //
 // Implementation landscape:
@@ -1372,8 +1386,8 @@ func (h *sentPacketHandler) updateAdaptiveThresholds(maxPacketReordering protoco
 	if enableAdaptiveTimeThreshold && maxTimeReordering > 0 && h.rttStats != nil {
 		maxRTT := max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT())
 		for h.reorderingShift > minReorderingShift {
-			currentThreshold := h.getTimeThreshold()
-			if time.Duration(float64(maxRTT)*currentThreshold) >= maxTimeReordering {
+			currentLossDelay := h.getLossDelay(maxRTT)
+			if currentLossDelay >= maxTimeReordering {
 				break
 			}
 			h.reorderingShift--

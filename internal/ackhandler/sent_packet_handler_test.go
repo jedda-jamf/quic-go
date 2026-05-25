@@ -1835,6 +1835,63 @@ func TestAdaptiveTimeThreshold(t *testing.T) {
 	require.InDelta(t, 2.0, h.getTimeThreshold(), 0.01)
 }
 
+func TestGetLossDelayIntegerShift(t *testing.T) {
+	// Verify getLossDelay uses exact QUICHE-style integer shift: rtt + (rtt >> shift)
+	h := &sentPacketHandler{}
+	rtt := 100 * time.Millisecond
+
+	// shift=2: rtt + (rtt >> 2) = 100ms + 25ms = 125ms
+	h.reorderingShift = 2
+	require.Equal(t, 125*time.Millisecond, h.getLossDelay(rtt))
+
+	// shift=1: rtt + (rtt >> 1) = 100ms + 50ms = 150ms
+	h.reorderingShift = 1
+	require.Equal(t, 150*time.Millisecond, h.getLossDelay(rtt))
+
+	// shift=0: rtt + (rtt >> 0) = 100ms + 100ms = 200ms
+	h.reorderingShift = 0
+	require.Equal(t, 200*time.Millisecond, h.getLossDelay(rtt))
+
+	// Test with odd RTT - bit shift on nanoseconds preserves sub-ms precision
+	oddRTT := 127 * time.Millisecond
+	h.reorderingShift = 2
+	// 127ms + (127ms >> 2) = 127ms + 31.75ms = 158.75ms
+	expected := oddRTT + (oddRTT >> 2)
+	require.Equal(t, expected, h.getLossDelay(oddRTT))
+}
+
+func TestMigratedPathUpdatesMTUForBDPScaling(t *testing.T) {
+	// Verify that MigratedPath updates maxDatagramSize for BDP-scaled thresholds.
+	// This ensures the loss detector uses the new path's MTU, not the old one.
+	h := &sentPacketHandler{
+		bytesInFlight:               120000, // 100 packets at 1200 MTU
+		maxDatagramSize:             1200,
+		adaptiveReorderingThreshold: 50, // Grown from spurious losses
+		reorderingShift:             1,  // Adapted from default 2
+		rttStats:                    utils.NewRTTStats(),
+		appDataPackets:              newPacketNumberSpace(0, true),
+	}
+
+	// Before migration: BDP threshold = 120000 / 1200 / 2 = 50
+	// With monotonic=50, threshold = max(BDP=50, monotonic=50) = 50
+	thresholdBefore := h.getPacketReorderingThreshold()
+	require.Equal(t, protocol.PacketNumber(50), thresholdBefore)
+
+	// Simulate migration to a path with larger MTU (jumbo frames)
+	newMTU := protocol.ByteCount(9000)
+	h.maxDatagramSize = newMTU
+	h.resetAdaptiveThresholds() // Also resets monotonic threshold
+
+	// After migration: BDP threshold = 120000 / 9000 / 2 = 6
+	// With monotonic reset to 3, threshold = max(BDP=6, monotonic=3) = 6
+	thresholdAfter := h.getPacketReorderingThreshold()
+	require.Equal(t, protocol.PacketNumber(6), thresholdAfter)
+
+	// Verify adaptive state was reset
+	require.Equal(t, protocol.PacketNumber(packetThreshold), h.adaptiveReorderingThreshold)
+	require.Equal(t, defaultReorderingShift, h.reorderingShift)
+}
+
 func BenchmarkSendAndAcknowledge(b *testing.B) {
 	b.Run("ack every: 2, in flight: 0", func(b *testing.B) {
 		benchmarkSendAndAcknowledge(b, 2, 0)
