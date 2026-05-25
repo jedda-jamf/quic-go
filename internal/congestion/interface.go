@@ -66,7 +66,11 @@ type AppLimitedHandler interface {
 // SpuriousLossHandler is implemented by congestion controllers that can react
 // to packets that were spuriously declared lost.
 type SpuriousLossHandler interface {
-	OnSpuriousLossDetected(packetNumber protocol.PacketNumber, packetReordering protocol.PacketNumber)
+	OnSpuriousLossDetected(
+		packetNumber protocol.PacketNumber,
+		packetReordering protocol.PacketNumber,
+		spuriousBytes protocol.ByteCount, // For byte-weighted episode accounting
+	)
 }
 
 // PacketReorderingThresholdProvider is implemented by congestion controllers

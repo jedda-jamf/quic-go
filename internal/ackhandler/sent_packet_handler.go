@@ -589,7 +589,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 		if slh, ok := h.congestion.(congestion.SpuriousLossHandler); ok {
 			for _, pn := range spuriousLosses {
 				packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
-				slh.OnSpuriousLossDetected(pn, packetReordering)
+				slh.OnSpuriousLossDetected(pn, packetReordering, 0)
 			}
 		}
 	}

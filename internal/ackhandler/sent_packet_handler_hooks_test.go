@@ -75,7 +75,7 @@ func (h *hookTrackingCongestion) OnECNFeedback(
 func (h *hookTrackingCongestion) MarkAppLimited(bytesInFlight protocol.ByteCount) {
 	h.appLimitedBytes = append(h.appLimitedBytes, bytesInFlight)
 }
-func (h *hookTrackingCongestion) OnSpuriousLossDetected(packetNumber, packetReordering protocol.PacketNumber) {
+func (h *hookTrackingCongestion) OnSpuriousLossDetected(packetNumber, packetReordering protocol.PacketNumber, _ protocol.ByteCount) {
 	h.spuriousPackets = append(h.spuriousPackets, packetNumber)
 	h.spuriousReordering = append(h.spuriousReordering, packetReordering)
 }
