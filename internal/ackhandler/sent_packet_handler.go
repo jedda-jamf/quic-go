@@ -1271,6 +1271,7 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
+	h.resetAdaptiveThresholds()
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
 		if !p.isPathProbePacket {
@@ -1377,4 +1378,11 @@ func (h *sentPacketHandler) updateAdaptiveThresholds(maxPacketReordering protoco
 			h.reorderingShift--
 		}
 	}
+}
+
+// resetAdaptiveThresholds resets adaptive thresholds to defaults.
+// Called on path migration since new path may have different reordering characteristics.
+func (h *sentPacketHandler) resetAdaptiveThresholds() {
+	h.adaptiveReorderingThreshold = packetThreshold
+	h.reorderingShift = defaultReorderingShift
 }
