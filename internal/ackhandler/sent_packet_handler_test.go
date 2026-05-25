@@ -1615,27 +1615,28 @@ func testSentPacketHandlerRandomized(t *testing.T, seed uint64) {
 }
 
 func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
-	// TODO: This test needs to be updated for adaptive packet reordering thresholds.
-	// With BDP scaling, the threshold increases with bytesInFlight, changing which
-	// packets are declared lost. The test logic needs to be reworked to account for
-	// the new threshold calculation.
-	t.Skip("Test needs updating for adaptive thresholds - see Task 5 implementation notes")
-
-	const rtt = time.Second
+	// This test verifies the spurious loss detection path using time-based loss.
+	// Time-based loss is more predictable than packet-threshold loss because
+	// the packet threshold varies with BDP scaling.
+	//
+	// We test two rounds of spurious loss to ensure the detection works repeatedly
+	// and that qlog events include correct reordering metrics.
+	const rtt = 100 * time.Millisecond
 
 	var eventRecorder events.Recorder
 
+	rttStats := utils.NewRTTStats()
 	sph := NewSentPacketHandler(
 		0,
 		1200,
-		utils.NewRTTStats(),
+		rttStats,
 		&utils.ConnectionStats{},
 		true,
 		false,
 		nil,
 		protocol.PerspectiveClient,
 		&eventRecorder,
-		nil, // customCC: use default NewReno
+		nil,
 		utils.DefaultLogger,
 	)
 
@@ -1649,101 +1650,136 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 
 	start := monotime.Now()
 	now := start
-	var pns []protocol.PacketNumber
-	for range 20 {
-		pns = append(pns, sendPacket(t, now))
-		now = now.Add(10 * time.Millisecond)
-	}
 
-	now = start.Add(rtt)
+	// First, establish RTT by sending and ACKing a packet
+	pnSetup := sendPacket(t, now)
+	now = now.Add(rtt)
 	_, err := sph.ReceivedAck(
-		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[6])},
+		&wire.AckFrame{AckRanges: ackRanges(pnSetup)},
 		protocol.Encryption1RTT,
 		now,
 	)
 	require.NoError(t, err)
-	require.Equal(t, []protocol.PacketNumber{pns[0], pns[6]}, packets.Acked)
-	// pns[4] and pns[5] are not yet declared lost
-	require.Equal(t, []protocol.PacketNumber{pns[1], pns[2], pns[3]}, packets.Lost)
-
 	packets.Reset()
 	eventRecorder.Clear()
 
-	const secondAckDelay = 50 * time.Millisecond
+	// =========================================================================
+	// Round 1: Send packets, lose by time threshold, ACK to detect spurious
+	// =========================================================================
 
-	now = now.Add(secondAckDelay)
+	// Send packets: pn1 and pn2 will be declared lost by time threshold,
+	// pn3 will be the "anchor" ACK that creates the gap, pn4 will be sent after
+	// the timeout so it can be ACKed to trigger spurious loss detection.
+	pn1SendTime := now
+	pn1 := sendPacket(t, now)
+	pn2SendTime := now // Same send time
+	pn2 := sendPacket(t, now)
+	now = now.Add(10 * time.Millisecond)
+	pn3 := sendPacket(t, now)
+
+	// ACK pn3 to create a gap
+	now = now.Add(rtt)
 	_, err = sph.ReceivedAck(
-		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[1], pns[2], pns[3], pns[4], pns[5], pns[6], pns[12], pns[16])},
+		&wire.AckFrame{AckRanges: ackRanges(pn3)},
 		protocol.Encryption1RTT,
 		now,
 	)
 	require.NoError(t, err)
-	require.Equal(t, []protocol.PacketNumber{pns[4], pns[5], pns[12], pns[16]}, packets.Acked)
-	require.Equal(t, []protocol.PacketNumber{pns[7], pns[8], pns[9], pns[10], pns[11], pns[13]}, packets.Lost)
-	require.Equal(t,
-		[]qlogwriter.Event{
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[1],
-				PacketReordering: 16 - 1,
-				TimeReordering:   rtt + secondAckDelay - 10*time.Millisecond,
-			},
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[2],
-				PacketReordering: 16 - 2,
-				TimeReordering:   rtt + secondAckDelay - 20*time.Millisecond,
-			},
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[3],
-				PacketReordering: 16 - 3,
-				TimeReordering:   rtt + secondAckDelay - 30*time.Millisecond,
-			},
-		},
-		eventRecorder.Events(qlog.SpuriousLoss{}),
-	)
+	require.Equal(t, []protocol.PacketNumber{pn3}, packets.Acked)
+	packets.Reset()
 	eventRecorder.Clear()
 
-	now = now.Add(secondAckDelay)
+	// Trigger time-based loss
+	timeout := sph.GetLossDetectionTimeout()
+	require.False(t, timeout.IsZero(), "loss detection timeout should be set")
+	now = timeout
+	sph.OnLossDetectionTimeout(now)
+	require.Contains(t, packets.Lost, pn1, "pn1 should be declared lost by time threshold")
+	require.Contains(t, packets.Lost, pn2, "pn2 should be declared lost by time threshold")
+	packets.Reset()
+	eventRecorder.Clear()
+
+	// Send pn4 after the loss timeout - we need a packet in flight to ACK
+	// so that ReceivedAck doesn't return early with empty ackedPackets
+	pn4 := sendPacket(t, now)
+
+	// Now ACK pn1, pn2, pn3, pn4 - pn4 is newly acked, which allows the function
+	// to proceed past the early return, and pn1/pn2 will be detected as spurious
+	ackTime1 := now.Add(10 * time.Millisecond)
 	_, err = sph.ReceivedAck(
-		&wire.AckFrame{AckRanges: ackRanges(pns[0], pns[1], pns[2], pns[3], pns[4], pns[5], pns[6], pns[7], pns[8], pns[9], pns[10], pns[16], pns[17], pns[18])},
+		&wire.AckFrame{AckRanges: ackRanges(pn1, pn2, pn3, pn4)},
+		protocol.Encryption1RTT,
+		ackTime1,
+	)
+	require.NoError(t, err)
+
+	// Verify spurious loss events
+	spuriousEvents := eventRecorder.Events(qlog.SpuriousLoss{})
+	require.Len(t, spuriousEvents, 2, "should have 2 spurious loss events for pn1 and pn2")
+
+	// Packet reordering is calculated from ack.LargestAcked() (pn4) to the lost packet
+	sl1 := spuriousEvents[0].(qlog.SpuriousLoss)
+	require.Equal(t, pn1, sl1.PacketNumber)
+	require.Equal(t, protocol.Encryption1RTT, sl1.EncryptionLevel)
+	require.Equal(t, uint64(pn4-pn1), sl1.PacketReordering, "packet reordering for pn1")
+	require.Equal(t, ackTime1.Sub(pn1SendTime), sl1.TimeReordering, "time reordering for pn1")
+
+	sl2 := spuriousEvents[1].(qlog.SpuriousLoss)
+	require.Equal(t, pn2, sl2.PacketNumber)
+	require.Equal(t, uint64(pn4-pn2), sl2.PacketReordering, "packet reordering for pn2")
+	require.Equal(t, ackTime1.Sub(pn2SendTime), sl2.TimeReordering, "time reordering for pn2")
+
+	eventRecorder.Clear()
+
+	// =========================================================================
+	// Round 2: Test that spurious loss detection continues to work
+	// =========================================================================
+
+	pn5SendTime := ackTime1
+	now = ackTime1
+	pn5 := sendPacket(t, now)
+	now = now.Add(10 * time.Millisecond)
+	pn6 := sendPacket(t, now)
+
+	// ACK pn6 to create a gap
+	now = now.Add(rtt)
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pn6)},
 		protocol.Encryption1RTT,
 		now,
 	)
 	require.NoError(t, err)
-	require.Equal(t, []protocol.PacketNumber{pns[4], pns[5], pns[12], pns[16], pns[17], pns[18]}, packets.Acked)
-	require.Equal(t, []protocol.PacketNumber{pns[7], pns[8], pns[9], pns[10], pns[11], pns[13], pns[14], pns[15]}, packets.Lost)
+	packets.Reset()
+	eventRecorder.Clear()
 
-	require.Equal(t,
-		[]qlogwriter.Event{
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[7],
-				PacketReordering: 18 - 7,
-				TimeReordering:   rtt + 2*secondAckDelay - 70*time.Millisecond,
-			},
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[8],
-				PacketReordering: 18 - 8,
-				TimeReordering:   rtt + 2*secondAckDelay - 80*time.Millisecond,
-			},
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[9],
-				PacketReordering: 18 - 9,
-				TimeReordering:   rtt + 2*secondAckDelay - 90*time.Millisecond,
-			},
-			qlog.SpuriousLoss{
-				EncryptionLevel:  protocol.Encryption1RTT,
-				PacketNumber:     pns[10],
-				PacketReordering: 18 - 10,
-				TimeReordering:   rtt + 2*secondAckDelay - 100*time.Millisecond,
-			},
-		},
-		eventRecorder.Events(qlog.SpuriousLoss{}),
+	// Trigger time-based loss for pn5
+	timeout = sph.GetLossDetectionTimeout()
+	require.False(t, timeout.IsZero())
+	now = timeout
+	sph.OnLossDetectionTimeout(now)
+	require.Contains(t, packets.Lost, pn5, "pn5 should be declared lost")
+	packets.Reset()
+	eventRecorder.Clear()
+
+	// Send pn7 after loss so we have a packet to ACK
+	pn7 := sendPacket(t, now)
+
+	// ACK pn5, pn6, pn7 to trigger spurious loss detection
+	ackTime2 := now.Add(10 * time.Millisecond)
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pn5, pn6, pn7)},
+		protocol.Encryption1RTT,
+		ackTime2,
 	)
+	require.NoError(t, err)
+
+	spuriousEvents = eventRecorder.Events(qlog.SpuriousLoss{})
+	require.Len(t, spuriousEvents, 1, "should have 1 spurious loss event for pn5")
+
+	sl5 := spuriousEvents[0].(qlog.SpuriousLoss)
+	require.Equal(t, pn5, sl5.PacketNumber)
+	require.Equal(t, uint64(pn7-pn5), sl5.PacketReordering)
+	require.Equal(t, ackTime2.Sub(pn5SendTime), sl5.TimeReordering)
 }
 
 func TestAdaptiveThresholdBDPScaling(t *testing.T) {

@@ -3047,6 +3047,71 @@ func TestBBRv3SpuriousRecoveryRequiresMajority(t *testing.T) {
 		"lossInRound should be cleared after spurious recovery")
 }
 
+func TestBBRv3SpuriousLossRecoveryRequiresMajority(t *testing.T) {
+	// Verifies that recovery triggers ONLY when >50% of bytes are spurious.
+	// This prevents single-packet majorities in multi-packet episodes.
+	bbr := newTestBBRv3()
+
+	// Set up constrained bounds
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+	bbr.inflightHi = 100_000
+	bbr.lossInRound = true
+
+	// Episode with 2 packets of 1200 bytes each = 2400 total
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{
+		1: 1200,
+		2: 1200,
+	}
+	bbr.lossEpisodeTotalBytes = 2400
+	bbr.lossEpisodeSpuriousBytes = 0
+
+	// Mark packet 1 as spurious: 1200/2400 = 50% exactly
+	// This should NOT trigger recovery (need >50%, not >=50%)
+	bbr.OnSpuriousLossDetected(1, 1, 1200)
+
+	require.True(t, bbr.lossEpisodeActive, "50% spurious should not trigger recovery")
+	require.Equal(t, protocol.ByteCount(500_000), bbr.bwLo, "bwLo should be unchanged at 50%")
+	require.Equal(t, protocol.ByteCount(50_000), bbr.inflightLo, "inflightLo should be unchanged at 50%")
+	require.True(t, bbr.lossInRound, "lossInRound should still be set")
+
+	// Now mark packet 2 as spurious: 2400/2400 = 100%
+	// This SHOULD trigger recovery (>50%)
+	bbr.OnSpuriousLossDetected(2, 2, 1200)
+
+	require.False(t, bbr.lossEpisodeActive, "100% spurious should trigger recovery")
+	require.Equal(t, protocol.MaxByteCount, bbr.bwLo, "bwLo should be restored")
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored")
+	require.False(t, bbr.lossInRound, "lossInRound should be cleared")
+}
+
+func TestBBRv3SpuriousLossRecoveryAt51Percent(t *testing.T) {
+	// Boundary test: 51% spurious should trigger recovery
+	bbr := newTestBBRv3()
+
+	bbr.bwLo = 500_000
+	bbr.inflightLo = 50_000
+	bbr.lossInRound = true
+
+	// Episode with asymmetric packets: 1000 + 960 = 1960 total bytes
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{
+		1: 1000,
+		2: 960,
+	}
+	bbr.lossEpisodeTotalBytes = 1960
+	bbr.lossEpisodeSpuriousBytes = 0
+
+	// Mark packet 1 as spurious: 1000/1960 = 51.02%
+	// This SHOULD trigger recovery (>50%)
+	bbr.OnSpuriousLossDetected(1, 1, 1000)
+
+	require.False(t, bbr.lossEpisodeActive, "51% spurious should trigger recovery")
+	require.Equal(t, protocol.MaxByteCount, bbr.bwLo, "bwLo should be restored at 51%")
+	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored at 51%")
+}
+
 // ############################################################################
 // PART 3: REGRESSION TESTS
 // ############################################################################

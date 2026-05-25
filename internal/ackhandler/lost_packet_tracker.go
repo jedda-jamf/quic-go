@@ -8,6 +8,7 @@ import (
 )
 
 // Seq3 is a three-value iterator function, analogous to iter.Seq2.
+// Go's iter package only provides Seq and Seq2; Seq3 doesn't exist in stdlib.
 type Seq3[K, V, W any] func(yield func(K, V, W) bool)
 
 type lostPacket struct {
