@@ -3,7 +3,6 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -239,15 +238,6 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
-	// Log effective packet reordering threshold at startup (unconditionally to stderr for diagnostics)
-	reorderThreshold := protocol.PacketNumber(packetThreshold)
-	implementsInterface := false
-	if pth, ok := cc.(congestion.PacketReorderingThresholdProvider); ok {
-		reorderThreshold = pth.GetPacketReorderThreshold()
-		implementsInterface = true
-	}
-	fmt.Fprintf(os.Stderr, "[quic-go] sent_packet_handler: packet_reorder_threshold=%d (default=%d, interface_detected=%v, cc_type=%T)\n",
-		reorderThreshold, packetThreshold, implementsInterface, cc)
 	return h
 }
 
@@ -926,13 +916,10 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pnSpace.lossTime = 0
-	packetReorderThreshold := protocol.PacketNumber(packetThreshold)
-	if pth, ok := h.congestion.(congestion.PacketReorderingThresholdProvider); ok {
-		packetReorderThreshold = pth.GetPacketReorderThreshold()
-	}
+	packetReorderThreshold := h.getPacketReorderingThreshold()
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
+	lossDelay := time.Duration(h.getTimeThreshold() * maxRTT)
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)

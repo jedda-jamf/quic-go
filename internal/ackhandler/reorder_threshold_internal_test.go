@@ -19,12 +19,14 @@ func TestBBRv3ImplementsPacketReorderingThresholdProvider(t *testing.T) {
         true,
         nil,
     )
-    
+
     // Store as the interface type that ackhandler uses
     var sa congestion.SendAlgorithmWithDebugInfos = bbr
-    
+
     // Check via SendAlgorithmWithDebugInfos (how ackhandler stores it)
+    // Note: This interface is still implemented by BBRv3 for backward compatibility,
+    // but the loss detector now owns threshold calculation (CC-agnostic architecture).
     pth, ok := sa.(congestion.PacketReorderingThresholdProvider)
     require.True(t, ok, "BBRv3 via SendAlgorithmWithDebugInfos should implement PacketReorderingThresholdProvider")
-    require.Equal(t, protocol.PacketNumber(10), pth.GetPacketReorderThreshold())
+    require.Equal(t, protocol.PacketNumber(1000), pth.GetPacketReorderThreshold())
 }
