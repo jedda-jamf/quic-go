@@ -634,6 +634,13 @@ func NewBBRV3(
 
 func (bbr *BBRv3) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
 	bbr.resetControllerState(initialMaxDatagramSize, monotime.Now())
+
+	// Clear episode tracking state - new paths need fresh tracking
+	bbr.lossEpisodeActive = false
+	bbr.lossEpisodePackets = nil
+	bbr.lossEpisodeTotalBytes = 0
+	bbr.lossEpisodeSpuriousBytes = 0
+	bbr.pendingLossPackets = nil
 }
 
 // GetPacketReorderThreshold returns the packet reordering threshold for loss detection.
