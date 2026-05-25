@@ -28,6 +28,49 @@ const (
 	minRTTAfterRetry = 5 * time.Millisecond
 	// The PTO duration uses exponential backoff, but is truncated to a maximum value, as allowed by RFC 8961, section 4.4.
 	maxPTODuration = 60 * time.Second
+
+	// ==========================================================================
+	// ADAPTIVE PACKET REORDERING THRESHOLD
+	// ==========================================================================
+	//
+	// Feature flags for A/B testing adaptive loss detection thresholds.
+	//
+	// Implementation landscape:
+	//
+	// 1. ngtcp2 (lib/ngtcp2_rtb.c, ngtcp2_rtb_detect_lost_pkt):
+	//    - Formula: threshold = max(3, min(256, bytes_in_flight / mtu / 2))
+	//    - Stateless: recomputed on every ACK processing pass
+	//    - Scales with BDP; naturally returns to 3 when window collapses
+	//    - Used by: Firefox, curl, various IoT stacks
+	//
+	// 2. Google QUICHE (general_loss_algorithm.cc, SpuriousLossDetected):
+	//    - Formula: threshold = max(threshold, largest_acked - packet_number + 1)
+	//    - Stateful: monotonically grows on each spurious loss detection
+	//    - Never decreases within connection, caps at 300
+	//    - Used by: Chrome, Google production QUIC
+	//
+	// 3. Cloudflare quiche (src/recovery/mod.rs):
+	//    - Constants: INITIAL_PACKET_THRESHOLD=3, MAX_PACKET_THRESHOLD=20
+	//    - More conservative caps than ngtcp2/QUICHE
+	//    - Used by: Cloudflare edge
+	//
+	// Our choice: Combine ngtcp2 BDP-scaling with QUICHE monotonic growth
+	//
+	// Why not Cloudflare's approach alone:
+	// - MAX_PACKET_THRESHOLD=20 is too low for high-BDP mobile paths we target
+	//
+	// Why not ngtcp2 alone:
+	// - BDP-scaling doesn't capture persistent path-specific reordering patterns
+
+	enableBDPScaledThreshold       = true  // threshold = bytesInFlight / mtu / 2
+	enableMonotonicThresholdGrowth = true  // threshold grows on spurious loss
+	enableAdaptiveTimeThreshold    = true  // QUICHE-style reorderingShift
+
+	maxAdaptiveReorderingThreshold = protocol.PacketNumber(300) // QUICHE kMaxPacketReorderingThreshold
+	maxBDPScaledThreshold          = protocol.PacketNumber(256) // ngtcp2 cap
+
+	defaultReorderingShift = uint(2) // Initial: loss_delay = rtt + rtt/4 (1.25x)
+	minReorderingShift     = uint(0) // Most permissive: loss_delay = 2*rtt
 )
 
 // Path probe packets are declared lost after this time.
@@ -115,6 +158,26 @@ type sentPacketHandler struct {
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
+
+	// ==========================================================================
+	// ADAPTIVE THRESHOLD STATE
+	// ==========================================================================
+	//
+	// These fields support adaptive packet reordering thresholds per research
+	// into ngtcp2 and QUICHE implementations.
+
+	// adaptiveReorderingThreshold tracks the monotonically growing packet
+	// threshold based on observed spurious losses. QUICHE-style: only grows,
+	// never shrinks within a connection. Reset on path migration.
+	adaptiveReorderingThreshold protocol.PacketNumber
+
+	// reorderingShift controls adaptive time threshold. QUICHE-style:
+	// loss_delay = rtt + (rtt >> shift). Decreases (widens) on time-based
+	// spurious loss. shift=2: 1.25x, shift=1: 1.5x, shift=0: 2.0x
+	reorderingShift uint
+
+	// maxDatagramSize cached for BDP-scaled threshold calculation.
+	maxDatagramSize protocol.ByteCount
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
@@ -168,6 +231,9 @@ func NewSentPacketHandler(
 		perspective:                    pers,
 		qlogger:                        qlogger,
 		logger:                         logger,
+		adaptiveReorderingThreshold:    packetThreshold,
+		reorderingShift:                defaultReorderingShift,
+		maxDatagramSize:                initialMaxDatagramSize,
 	}
 	if enableECN {
 		h.enableECN = true
