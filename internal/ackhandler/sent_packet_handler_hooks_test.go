@@ -324,7 +324,7 @@ func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
 	}
 
 	handler := sph.(*sentPacketHandler)
-	handler.lostPackets.Add(0, firstSendTime)
+	handler.lostPackets.Add(0, firstSendTime, 1200)
 	handler.detectSpuriousLosses(
 		&wire.AckFrame{
 			AckRanges: []wire.AckRange{

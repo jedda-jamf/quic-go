@@ -551,7 +551,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
-	for pn, sendTime := range h.lostPackets.All() {
+	h.lostPackets.All()(func(pn protocol.PacketNumber, sendTime monotime.Time, _ protocol.ByteCount) bool {
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
 			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
@@ -562,7 +562,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			ackRange = ack.AckRanges[ackRangeIdx]
 		}
 		if pn < ackRange.Smallest {
-			continue
+			return true // continue to next packet
 		}
 		if pn <= ackRange.Largest {
 			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
@@ -580,7 +580,8 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			}
 			spuriousLosses = append(spuriousLosses, pn)
 		}
-	}
+		return true // continue iteration
+	})
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
 	}
@@ -922,7 +923,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		}
 		if packetLost {
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.lostPackets.Add(pn, p.SendTime)
+				h.lostPackets.Add(pn, p.SendTime, p.Length)
 			}
 			pnSpace.history.DeclareLost(pn)
 			if !p.isPathProbePacket && p.IsAckEliciting() {

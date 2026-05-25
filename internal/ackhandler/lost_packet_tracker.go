@@ -1,16 +1,19 @@
 package ackhandler
 
 import (
-	"iter"
 	"slices"
 
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 )
 
+// Seq3 is a three-value iterator function, analogous to iter.Seq2.
+type Seq3[K, V, W any] func(yield func(K, V, W) bool)
+
 type lostPacket struct {
 	PacketNumber protocol.PacketNumber
 	SendTime     monotime.Time
+	Length       protocol.ByteCount
 }
 
 type lostPacketTracker struct {
@@ -27,13 +30,14 @@ func newLostPacketTracker(maxLength int) *lostPacketTracker {
 	}
 }
 
-func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time) {
+func (t *lostPacketTracker) Add(p protocol.PacketNumber, sendTime monotime.Time, length protocol.ByteCount) {
 	if len(t.lostPackets) == t.maxLength {
 		t.lostPackets = t.lostPackets[1:]
 	}
 	t.lostPackets = append(t.lostPackets, lostPacket{
 		PacketNumber: p,
 		SendTime:     sendTime,
+		Length:       length,
 	})
 }
 
@@ -46,10 +50,10 @@ func (t *lostPacketTracker) Delete(pn protocol.PacketNumber) {
 	})
 }
 
-func (t *lostPacketTracker) All() iter.Seq2[protocol.PacketNumber, monotime.Time] {
-	return func(yield func(protocol.PacketNumber, monotime.Time) bool) {
+func (t *lostPacketTracker) All() Seq3[protocol.PacketNumber, monotime.Time, protocol.ByteCount] {
+	return func(yield func(protocol.PacketNumber, monotime.Time, protocol.ByteCount) bool) {
 		for _, p := range t.lostPackets {
-			if !yield(p.PacketNumber, p.SendTime) {
+			if !yield(p.PacketNumber, p.SendTime, p.Length) {
 				return
 			}
 		}
