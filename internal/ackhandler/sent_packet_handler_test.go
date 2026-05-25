@@ -1725,6 +1725,59 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	)
 }
 
+func TestAdaptiveThresholdBDPScaling(t *testing.T) {
+	// With 100KB in flight and 1200 byte MTU:
+	// BDP threshold = 100000 / 1200 / 2 = 41
+	h := &sentPacketHandler{
+		bytesInFlight:               100000,
+		maxDatagramSize:             1200,
+		adaptiveReorderingThreshold: packetThreshold,
+		reorderingShift:             defaultReorderingShift,
+	}
+
+	threshold := h.getPacketReorderingThreshold()
+	require.GreaterOrEqual(t, threshold, protocol.PacketNumber(41))
+	require.LessOrEqual(t, threshold, protocol.PacketNumber(256)) // BDP cap
+}
+
+func TestAdaptiveThresholdMonotonicGrowth(t *testing.T) {
+	h := &sentPacketHandler{
+		bytesInFlight:               1200, // Low BDP = threshold 3
+		maxDatagramSize:             1200,
+		adaptiveReorderingThreshold: 50, // Previously grown
+		reorderingShift:             defaultReorderingShift,
+	}
+
+	threshold := h.getPacketReorderingThreshold()
+	require.Equal(t, protocol.PacketNumber(50), threshold)
+}
+
+func TestAdaptiveThresholdCaps(t *testing.T) {
+	h := &sentPacketHandler{
+		bytesInFlight:               100000000, // Huge BDP
+		maxDatagramSize:             1200,
+		adaptiveReorderingThreshold: 500, // Above cap
+		reorderingShift:             defaultReorderingShift,
+	}
+
+	threshold := h.getPacketReorderingThreshold()
+	// Should be capped at maxAdaptiveReorderingThreshold (300)
+	require.LessOrEqual(t, threshold, maxAdaptiveReorderingThreshold)
+}
+
+func TestAdaptiveTimeThreshold(t *testing.T) {
+	h := &sentPacketHandler{
+		reorderingShift: 2, // 1.25x
+	}
+	require.InDelta(t, 1.25, h.getTimeThreshold(), 0.01)
+
+	h.reorderingShift = 1 // 1.5x
+	require.InDelta(t, 1.5, h.getTimeThreshold(), 0.01)
+
+	h.reorderingShift = 0 // 2.0x
+	require.InDelta(t, 2.0, h.getTimeThreshold(), 0.01)
+}
+
 func BenchmarkSendAndAcknowledge(b *testing.B) {
 	b.Run("ack every: 2, in flight: 0", func(b *testing.B) {
 		benchmarkSendAndAcknowledge(b, 2, 0)

@@ -1303,3 +1303,48 @@ func (h *sentPacketHandler) MarkAppLimited() {
 		marker.MarkAppLimited(h.bytesInFlight)
 	}
 }
+
+// getPacketReorderingThreshold returns the effective packet reordering threshold.
+//
+// Implementation landscape:
+// - ngtcp2: stateless BDP scaling (bytesInFlight / mtu / 2)
+// - QUICHE: stateful monotonic growth on spurious loss
+//
+// Our choice: Use maximum of both, giving immediate BDP tolerance plus
+// learned path-specific reordering patterns.
+func (h *sentPacketHandler) getPacketReorderingThreshold() protocol.PacketNumber {
+	threshold := protocol.PacketNumber(packetThreshold) // RFC 9002 default: 3
+
+	if enableBDPScaledThreshold && h.maxDatagramSize > 0 {
+		bdpThreshold := protocol.PacketNumber(h.bytesInFlight / h.maxDatagramSize / 2)
+		bdpThreshold = max(packetThreshold, bdpThreshold)
+		bdpThreshold = min(maxBDPScaledThreshold, bdpThreshold)
+		threshold = bdpThreshold
+	}
+
+	if enableMonotonicThresholdGrowth {
+		threshold = max(threshold, h.adaptiveReorderingThreshold)
+	}
+
+	return min(threshold, maxAdaptiveReorderingThreshold)
+}
+
+// getTimeThreshold returns the effective time threshold multiplier.
+//
+// Implementation landscape:
+// - RFC 9002: fixed 9/8 (1.125x RTT)
+// - QUICHE: adaptive via reorderingShift, starts at 1.25x, widens to 2.0x
+//
+// Our choice: QUICHE-style adaptive, starting at 1.25x (slightly more
+// permissive than RFC 9002) and widening on time-based spurious loss.
+//
+// Note: Moving from RFC 9002's 9/8 to 1.25x is intentional. Must verify
+// via testing that this doesn't unacceptably delay real loss detection.
+func (h *sentPacketHandler) getTimeThreshold() float64 {
+	if !enableAdaptiveTimeThreshold {
+		return timeThreshold // RFC 9002 default: 9/8 = 1.125
+	}
+	// QUICHE-style: 1 + (1 >> shift)
+	// shift=2: 1.25, shift=1: 1.5, shift=0: 2.0
+	return 1.0 + (1.0 / float64(uint(1)<<h.reorderingShift))
+}
