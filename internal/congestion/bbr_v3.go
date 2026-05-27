@@ -1475,16 +1475,17 @@ func (bbr *BBRv3) handleQueueTooHighInStartup() {
 // The algorithm detects bandwidth saturation by looking for a plateau in
 // RS.delivery_rate across multiple packet-timed round trips:
 //   1. If delivery_rate >= full_bw * 1.25 (25% growth), reset counter
-//   2. Otherwise, increment full_bw_count
+//   2. Otherwise, increment full_bw_count at round boundaries
 //   3. After 3 consecutive rounds without 25% growth, declare filled pipe
 //
-// CRITICAL: This function MUST only run on round_start boundaries.
-// Per RFC §5.3.1.2: "upon an ACK...when the delivery rate sample is not
-// application-limited, BBR runs the 'full pipe' estimator."
-// The round_start gate ensures bandwidth growth is evaluated once per
-// round trip, not on every ACK. Without this gate, intra-round delivery
-// rate fluctuations would repeatedly reset the counter, preventing Startup
-// from ever detecting a bandwidth plateau.
+// IMPORTANT: Growth detection runs on EVERY valid non-app-limited ACK, but
+// the no-growth counter only increments at round boundaries. This matches
+// Google's BBRv3 reference implementation (tcp_bbr.c bbr_check_full_bw_reached).
+//
+// Rationale: The round-boundary ACK may have an unrepresentatively low
+// delivery rate due to ACK timing variance. By checking growth on every ACK,
+// ANY high-rate sample in the round can reset the baseline, preventing
+// false-positive "filled pipe" detection from a single unlucky sample.
 //
 // State-gate: this estimator only applies to Startup. ProbeRTT can be entered
 // before fullBandwidthReached (via probe_rtt_interval expiry), and the reduced
@@ -1494,13 +1495,20 @@ func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
 	if bbr.state != BBRStartup {
 		return
 	}
-	if bbr.fullBandwidthNow || !bbr.roundStart || rs.isAppLimited || rs.deliveryRate == 0 {
+	if bbr.fullBandwidthNow || rs.isAppLimited || rs.deliveryRate == 0 {
 		return
 	}
+	// Growth check runs on every valid ACK (not gated on roundStart).
+	// This ensures any high-rate sample in the round can reset the baseline.
 	thresh := protocol.ByteCount(float64(max(bbr.fullBandwidth, 1)) * FULL_BW_GROWTH_THRESHOLD)
 	if rs.deliveryRate >= thresh {
 		bbr.resetFullBw()
 		bbr.fullBandwidth = rs.deliveryRate
+		return
+	}
+	// No-growth counter only increments at round boundaries.
+	// This preserves the "3 rounds without growth" semantic.
+	if !bbr.roundStart {
 		return
 	}
 	bbr.fullBandwidthCount++

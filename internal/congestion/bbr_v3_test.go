@@ -1775,30 +1775,70 @@ func TestBBRv3StartupExitByFullBwPlateau(t *testing.T) {
 	require.Equal(t, BBRDrain, bbr.state)
 }
 
-func TestBBRv3CheckFullBwReachedIgnoresIntraRoundSamples(t *testing.T) {
+// TestBBRv3CheckFullBwReachedIntraRoundGrowthResets verifies that intra-round
+// high-rate samples reset the full bandwidth baseline (Google-style behavior).
+// This prevents false-positive "filled pipe" detection when the round-boundary
+// ACK has an unrepresentatively low delivery rate.
+func TestBBRv3CheckFullBwReachedIntraRoundGrowthResets(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.state = BBRStartup
 	bbr.fullBandwidth = 1_000
 	bbr.bwHi[0] = 1_000
 	bbr.minRTT = 10 * time.Millisecond
 
+	// Round-start sample shows no growth (1100 < 1000 * 1.25 = 1250)
 	plateau := bbrRateSample{deliveryRate: 1_100}
+	// Intra-round sample shows growth (1300 >= 1000 * 1.25 = 1250)
 	intraRoundSpike := bbrRateSample{deliveryRate: 1_300}
 
+	// Round 1: plateau sample increments count
+	bbr.roundStart = true
+	bbr.checkFullBwReached(plateau)
+	require.Equal(t, 1, bbr.fullBandwidthCount)
+	require.Equal(t, protocol.ByteCount(1_000), bbr.fullBandwidth)
+
+	// Intra-round spike resets count (Google-style: growth check on every ACK)
+	bbr.roundStart = false
+	bbr.checkFullBwReached(intraRoundSpike)
+	require.Equal(t, 0, bbr.fullBandwidthCount,
+		"intra-round growth sample must reset the counter")
+	require.Equal(t, protocol.ByteCount(1_300), bbr.fullBandwidth,
+		"intra-round growth sample must advance the baseline")
+
+	// Subsequent rounds: with higher baseline (1300), plateau (1100) shows no growth
+	// Need 3 consecutive no-growth rounds to trigger
 	for round := 0; round < FULL_BW_ROUNDS; round++ {
 		bbr.roundStart = true
 		bbr.checkFullBwReached(plateau)
 		require.Equal(t, round+1, bbr.fullBandwidthCount)
-
-		bbr.roundStart = false
-		bbr.checkFullBwReached(intraRoundSpike)
-		require.Equal(t, round+1, bbr.fullBandwidthCount,
-			"non-round-start ACKs must not reset the full bandwidth detector")
-		require.Equal(t, protocol.ByteCount(1_000), bbr.fullBandwidth,
-			"non-round-start ACKs must not advance the full bandwidth baseline")
 	}
-
 	require.True(t, bbr.fullBandwidthReached)
+}
+
+// TestBBRv3CheckFullBwReachedCountOnlyAtRoundStart verifies that the no-growth
+// counter only increments at round boundaries, even though growth detection
+// runs on every ACK.
+func TestBBRv3CheckFullBwReachedCountOnlyAtRoundStart(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRStartup
+	bbr.fullBandwidth = 1_000
+	bbr.bwHi[0] = 1_000
+	bbr.minRTT = 10 * time.Millisecond
+
+	// No-growth sample (1100 < 1000 * 1.25 = 1250)
+	noGrowth := bbrRateSample{deliveryRate: 1_100}
+
+	// Intra-round no-growth samples should NOT increment counter
+	bbr.roundStart = false
+	bbr.checkFullBwReached(noGrowth)
+	require.Equal(t, 0, bbr.fullBandwidthCount,
+		"non-round-start no-growth samples must not increment counter")
+
+	// Round-start no-growth sample SHOULD increment counter
+	bbr.roundStart = true
+	bbr.checkFullBwReached(noGrowth)
+	require.Equal(t, 1, bbr.fullBandwidthCount,
+		"round-start no-growth samples must increment counter")
 }
 
 func TestBBRv3StartupExitByExcessiveLoss(t *testing.T) {
