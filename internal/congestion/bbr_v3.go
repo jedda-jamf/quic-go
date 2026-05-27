@@ -557,6 +557,14 @@ type BBRv3 struct {
 	undoInflightLo   protocol.ByteCount
 	undoInflightHi   protocol.ByteCount
 	undoCwnd         protocol.ByteCount
+
+	// Round-level diagnostic accumulators for qlog telemetry.
+	// These track per-round statistics to diagnose filled-pipe estimator issues
+	// without requiring per-ACK event emission. Reset on each round boundary.
+	validSamplesInRound      uint32             // ACKs with deliveryRate > 0
+	suppressedSamplesInRound uint32             // ACKs where interval < min_rtt caused suppression
+	maxDeliveryRateInRound   protocol.ByteCount // Highest valid deliveryRate this round
+	totalAckEventsInRound    uint32             // Total ACK events processed this round
 }
 
 var (
@@ -1111,10 +1119,23 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 	// Per RFC §4.1.2.3, suppress delivery_rate when interval < min_rtt.
 	// The ACK still carries valid delivered-volume and round-boundary signals;
 	// only the rate sample itself is unreliable.
+	sampleWasSuppressed := false
 	if bbr.minRTT > 0 && rs.interval < bbr.minRTT {
 		rs.deliveryRate = 0
+		sampleWasSuppressed = true
 	}
 	bbr.totalBytesAckedCE += uint64(rs.deliveredCE)
+
+	// Update round-level diagnostic accumulators for qlog telemetry.
+	bbr.totalAckEventsInRound++
+	if sampleWasSuppressed {
+		bbr.suppressedSamplesInRound++
+	} else if rs.deliveryRate > 0 {
+		bbr.validSamplesInRound++
+		if rs.deliveryRate > bbr.maxDeliveryRateInRound {
+			bbr.maxDeliveryRateInRound = rs.deliveryRate
+		}
+	}
 
 	// Linux-v3 model update order (collapsed from tcp_bbr.c helpers):
 	// 1) round / delivery signal bookkeeping
@@ -1807,7 +1828,9 @@ func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
 	if rttSample <= 0 {
 		return
 	}
-	probeExpired := bbr.probeRTTMinStamp.IsZero() || now.Sub(bbr.probeRTTMinStamp) > PROBE_RTT_INTERVAL
+	// Capture whether stamp was zero BEFORE potential update (for diagnostics)
+	probeRTTMinStampWasZero := bbr.probeRTTMinStamp.IsZero()
+	probeExpired := probeRTTMinStampWasZero || now.Sub(bbr.probeRTTMinStamp) > PROBE_RTT_INTERVAL
 	if bbr.probeRTTMinDelay == 0 || rttSample < bbr.probeRTTMinDelay || probeExpired {
 		bbr.probeRTTMinDelay = rttSample
 		bbr.probeRTTMinStamp = now
@@ -1820,12 +1843,24 @@ func (bbr *BBRv3) updateMinRTT(now monotime.Time) {
 	}
 
 	if probeExpired && !bbr.idleRestart && bbr.state != BBRProbeRTT {
+		stateBefore := bbr.state.String()
 		bbr.state = BBRProbeRTT
 		bbr.saveCwnd()
 		bbr.probeRTTDoneStamp = 0
 		bbr.probeRTTRoundDone = false
 		bbr.ackPhase = ackPhaseProbeStopping
 		bbr.startRoundNow()
+		// Emit diagnostic event for ProbeRTT entry analysis
+		if bbr.qlogger != nil {
+			bbr.qlogger.RecordEvent(qlog.BBRv3ProbeRTTCheck{
+				RTTSample:               rttSample,
+				ProbeRTTMinStampWasZero: probeRTTMinStampWasZero,
+				ProbeExpired:            probeExpired,
+				IdleRestart:             bbr.idleRestart,
+				RoundCount:              bbr.roundCount,
+				StateBefore:             stateBefore,
+			})
+		}
 	}
 
 	if bbr.state == BBRProbeRTT {
@@ -2398,6 +2433,16 @@ func (bbr *BBRv3) maybeQlogRoundUpdate(rs bbrRateSample) {
 		bbr.qlogger.RecordEvent(bbr.qlogModelUpdate("startup_round"))
 		bbr.qlogger.RecordEvent(bbr.qlogControlUpdate("startup_round"))
 	}
+	// Reset round-level diagnostic accumulators after emitting qlog.
+	// The next round will start fresh accumulation.
+	bbr.resetRoundDiagnostics()
+}
+
+func (bbr *BBRv3) resetRoundDiagnostics() {
+	bbr.validSamplesInRound = 0
+	bbr.suppressedSamplesInRound = 0
+	bbr.maxDeliveryRateInRound = 0
+	bbr.totalAckEventsInRound = 0
 }
 
 func (bbr *BBRv3) qlogPhase() string {
@@ -2466,6 +2511,12 @@ func (bbr *BBRv3) qlogRoundUpdate(rs bbrRateSample) qlog.BBRv3RoundUpdated {
 		SendElapsed:        rs.sendElapsed,
 		AckElapsed:         rs.ackElapsed,
 		RateSampleInterval: rs.interval,
+		// Round-level diagnostic fields for filled-pipe estimator analysis
+		MinRTT:                   bbr.minRTT,
+		ValidSamplesInRound:      bbr.validSamplesInRound,
+		SuppressedSamplesInRound: bbr.suppressedSamplesInRound,
+		MaxDeliveryRateInRound:   uint64(bbr.maxDeliveryRateInRound),
+		TotalAckEventsInRound:    bbr.totalAckEventsInRound,
 	}
 }
 

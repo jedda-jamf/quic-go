@@ -968,6 +968,12 @@ type BBRv3RoundUpdated struct {
 	SendElapsed        time.Duration
 	AckElapsed         time.Duration
 	RateSampleInterval time.Duration
+	// Round-level diagnostic fields for filled-pipe estimator analysis
+	MinRTT                   time.Duration // Current min_rtt for interval comparison
+	ValidSamplesInRound      uint32        // ACK events with deliveryRate > 0 this round
+	SuppressedSamplesInRound uint32        // ACK events where interval < min_rtt
+	MaxDeliveryRateInRound   uint64        // Highest valid deliveryRate this round
+	TotalAckEventsInRound    uint32        // Total ACK events processed this round
 }
 
 func (e BBRv3RoundUpdated) Name() string { return "recovery:bbr_round_updated" }
@@ -1021,6 +1027,17 @@ func (e BBRv3RoundUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.Float(milliseconds(e.AckElapsed)))
 	h.WriteToken(jsontext.String("rate_sample_interval"))
 	h.WriteToken(jsontext.Float(milliseconds(e.RateSampleInterval)))
+	// Round-level diagnostic fields
+	h.WriteToken(jsontext.String("min_rtt"))
+	h.WriteToken(jsontext.Float(milliseconds(e.MinRTT)))
+	h.WriteToken(jsontext.String("valid_samples_in_round"))
+	h.WriteToken(jsontext.Uint(uint64(e.ValidSamplesInRound)))
+	h.WriteToken(jsontext.String("suppressed_samples_in_round"))
+	h.WriteToken(jsontext.Uint(uint64(e.SuppressedSamplesInRound)))
+	h.WriteToken(jsontext.String("max_delivery_rate_in_round"))
+	h.WriteToken(jsontext.Uint(e.MaxDeliveryRateInRound))
+	h.WriteToken(jsontext.String("total_ack_events_in_round"))
+	h.WriteToken(jsontext.Uint(uint64(e.TotalAckEventsInRound)))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -1040,6 +1057,39 @@ func (e BBRv3ECNUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.Float(e.ECNAlpha))
 	h.WriteToken(jsontext.String("ecn_eligible"))
 	h.WriteToken(jsontext.Bool(e.ECNEligible))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// BBRv3ProbeRTTCheck is emitted when BBRv3 enters ProbeRTT state.
+// This event captures the decision factors that led to ProbeRTT entry,
+// enabling diagnosis of spurious ProbeRTT transitions during Startup.
+type BBRv3ProbeRTTCheck struct {
+	RTTSample               time.Duration // RTT sample from this ACK event
+	ProbeRTTMinStampWasZero bool          // Was probeRTTMinStamp uninitialized?
+	ProbeExpired            bool          // Did probe_rtt_interval expire?
+	IdleRestart             bool          // Was idleRestart flag set?
+	RoundCount              uint64        // Current round count
+	StateBefore             string        // BBR state before this transition
+}
+
+func (e BBRv3ProbeRTTCheck) Name() string { return "recovery:bbr_probe_rtt_check" }
+
+func (e BBRv3ProbeRTTCheck) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("rtt_sample"))
+	h.WriteToken(jsontext.Float(milliseconds(e.RTTSample)))
+	h.WriteToken(jsontext.String("probe_rtt_min_stamp_was_zero"))
+	h.WriteToken(jsontext.Bool(e.ProbeRTTMinStampWasZero))
+	h.WriteToken(jsontext.String("probe_expired"))
+	h.WriteToken(jsontext.Bool(e.ProbeExpired))
+	h.WriteToken(jsontext.String("idle_restart"))
+	h.WriteToken(jsontext.Bool(e.IdleRestart))
+	h.WriteToken(jsontext.String("round_count"))
+	h.WriteToken(jsontext.Uint(e.RoundCount))
+	h.WriteToken(jsontext.String("state_before"))
+	h.WriteToken(jsontext.String(e.StateBefore))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
