@@ -633,6 +633,7 @@ func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount
 	bbr.lastState = BBRStartup
 	bbr.lastPhase = probeBWDown
 	bbr.ackEpochStart = now
+	bbr.probeRTTMinStamp = now
 	bbr.undoBwLo = protocol.MaxByteCount
 	bbr.undoInflightLo = protocol.MaxByteCount
 	bbr.undoInflightHi = protocol.MaxByteCount
