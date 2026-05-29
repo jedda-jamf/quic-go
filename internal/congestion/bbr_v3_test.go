@@ -3474,3 +3474,25 @@ func TestBBRv3GuardrailZeroInflightFromAckEventStart(t *testing.T) {
 		"should transition to CRUISE when inflight=0 (fix applied); "+
 			"if still in DOWN, the bug caused reconstruction to ~%d instead of 0", reconstructed)
 }
+
+func TestBBRv3SustainedLossStability(t *testing.T) {
+	// This test requires a closed-loop path model where ACKs are fed at a rate
+	// driven by the controller's own cwnd/pacing decisions. The existing test
+	// harness uses event-path testing (inject specific events, check state).
+	//
+	// Test parameters (when implemented):
+	// - Offered rate: 1 Gbps (125 MB/s)
+	// - RTT: 50ms
+	// - BDP: 6.25 MB (125 MB/s × 0.05s)
+	// - Rounds: 200
+	// - Loss rate: 3% of tx_in_flight per sample
+	//
+	// Assertions:
+	// - maxBandwidth() >= 62.5 MB/s (0.5x offered)
+	// - cwnd >= 3.125 MB (0.5x BDP)
+	// - bwLo >= 10 MB/s (does not collapse to near-zero)
+	//
+	// Current behavior: unknown pending closed-loop harness implementation.
+	// This test documents the requirement and will be enabled when the harness exists.
+	t.Skip("Requires closed-loop path model harness (not yet implemented)")
+}
