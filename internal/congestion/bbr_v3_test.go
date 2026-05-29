@@ -2664,11 +2664,10 @@ func TestBBRv3AckEpochUnderflowGuard(t *testing.T) {
 	}, "should handle zero maxDatagramSize gracefully")
 }
 
-// TestBBRv3SpuriousLossPinsPerPacketSemantics pins the per-packet spurious loss
-// detection behavior. Draft-ietf-ccwg-bbr-05 §5.2.5 / §5.5.11 specify episode-level
-// semantics (undo only when entire episode is spurious), but the current implementation
-// restores model bounds on the first spurious packet detection.
-func TestBBRv3SpuriousLossPinsPerPacketSemantics(t *testing.T) {
+// TestBBRv3SpuriousLossNoopWithoutEpisode verifies that OnSpuriousLossDetected
+// is a no-op when no loss episode is active. Per RFC §5.5.11 episode-level
+// semantics, spurious loss detection only applies to packets in an active episode.
+func TestBBRv3SpuriousLossNoopWithoutEpisode(t *testing.T) {
 	bbr := newTestBBRv3()
 
 	// Set up known model state
@@ -2684,18 +2683,21 @@ func TestBBRv3SpuriousLossPinsPerPacketSemantics(t *testing.T) {
 	bbr.undoInflightHi = 150_000
 	bbr.undoCwnd = 120_000
 
-	// Call OnSpuriousLossDetected for a single packet
+	// NO active episode - OnSpuriousLossDetected should be a no-op
+	require.False(t, bbr.lossEpisodeActive, "no episode should be active")
+
+	// Call OnSpuriousLossDetected for a packet not in any episode
 	bbr.OnSpuriousLossDetected(1, 1)
 
-	// Per-packet semantics: bounds should be restored immediately
-	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo,
-		"bwLo should be restored to max(current, saved)")
-	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo,
-		"inflightLo should be restored")
-	require.Equal(t, protocol.ByteCount(150_000), bbr.inflightHi,
-		"inflightHi should be restored")
-	require.False(t, bbr.lossInRound,
-		"lossInRound should be cleared")
+	// Episode-level semantics: bounds should NOT be restored without active episode
+	require.Equal(t, protocol.ByteCount(500_000), bbr.bwLo,
+		"bwLo should NOT be restored without active episode")
+	require.Equal(t, protocol.ByteCount(50_000), bbr.inflightLo,
+		"inflightLo should NOT be restored without active episode")
+	require.Equal(t, protocol.ByteCount(100_000), bbr.inflightHi,
+		"inflightHi should NOT be restored without active episode")
+	require.True(t, bbr.lossInRound,
+		"lossInRound should NOT be cleared without active episode")
 }
 
 func TestBBRv3Name(t *testing.T) {
@@ -2790,6 +2792,12 @@ func TestBBRv3SpuriousLossRecoveryRestoresStartupState(t *testing.T) {
 	bbr.state = BBRDrain
 	bbr.fullBandwidthReached = true
 
+	// Set up active episode with one packet (100% spurious meets >50% threshold)
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{1: 1200}
+	bbr.lossEpisodeTotalBytes = 1200
+	bbr.lossEpisodeSpuriousBytes = 0
+
 	// Spurious loss detected - should restore Startup state
 	bbr.OnSpuriousLossDetected(1, 1)
 
@@ -2811,6 +2819,12 @@ func TestBBRv3SpuriousLossRecoveryRestoresUnconstrainedState(t *testing.T) {
 	bbr.bwLo = 500_000
 	bbr.inflightLo = 50_000
 	bbr.inflightHi = 100_000
+
+	// Set up active episode with one packet (100% spurious meets >50% threshold)
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{1: 1200}
+	bbr.lossEpisodeTotalBytes = 1200
+	bbr.lossEpisodeSpuriousBytes = 0
 
 	// Per RFC §5.5.11.2: bwLo = max(bwLo, undo_bwLo)
 	// If undo values are MaxByteCount (unconstrained), recovery should
@@ -2840,13 +2854,20 @@ func TestBBRv3SpuriousLossRecoveryIdempotent(t *testing.T) {
 	bbr.inflightLo = 50_000
 	bbr.inflightHi = 90_000
 
-	// First call restores
+	// Set up active episode with one packet (100% spurious meets >50% threshold)
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{1: 1200}
+	bbr.lossEpisodeTotalBytes = 1200
+	bbr.lossEpisodeSpuriousBytes = 0
+
+	// First call restores (and clears episode)
 	bbr.OnSpuriousLossDetected(1, 1)
 	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo)
 	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
 	require.Equal(t, protocol.ByteCount(120_000), bbr.inflightHi)
+	require.False(t, bbr.lossEpisodeActive, "episode should be cleared after restoration")
 
-	// Second call should be idempotent (no further changes)
+	// Second call should be idempotent (no episode active, so no-op)
 	bbr.OnSpuriousLossDetected(1, 1)
 	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo)
 	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo)
@@ -2876,6 +2897,12 @@ func TestBBRv3SpuriousLossRecoveryCwnd(t *testing.T) {
 	bbr.congestionWindow = 50_000 // Cwnd was capped by reduced inflightLo
 
 	require.Equal(t, protocol.ByteCount(50_000), bbr.congestionWindow)
+
+	// Set up active episode with one packet (100% spurious meets >50% threshold)
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{1: 1200}
+	bbr.lossEpisodeTotalBytes = 1200
+	bbr.lossEpisodeSpuriousBytes = 0
 
 	// Spurious loss detected - should restore both bounds AND cwnd
 	bbr.OnSpuriousLossDetected(1, 1)
@@ -2917,6 +2944,12 @@ func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
 	require.NotEqual(t, protocol.MaxByteCount, bbr.bwLo)
 	require.NotEqual(t, protocol.MaxByteCount, bbr.inflightLo)
 
+	// Set up active episode with one packet (100% spurious meets >50% threshold)
+	bbr.lossEpisodeActive = true
+	bbr.lossEpisodePackets = map[protocol.PacketNumber]protocol.ByteCount{1: 1200}
+	bbr.lossEpisodeTotalBytes = 1200
+	bbr.lossEpisodeSpuriousBytes = 0
+
 	// Spurious loss detected - should restore to MaxByteCount (unconstrained)
 	bbr.OnSpuriousLossDetected(1, 1)
 
@@ -2924,6 +2957,94 @@ func TestBBRv3SpuriousLossAfterRefillRestoresUnconstrained(t *testing.T) {
 	// This was broken before the fix - the != MaxByteCount check prevented restoration
 	require.Equal(t, protocol.MaxByteCount, bbr.bwLo, "bwLo should be restored to unconstrained")
 	require.Equal(t, protocol.MaxByteCount, bbr.inflightLo, "inflightLo should be restored to unconstrained")
+}
+
+// TestBBRv3SpuriousRecoveryRequiresMajority verifies RFC §5.5.11 episode-level
+// semantics: spurious loss recovery only triggers when >50% of episode bytes
+// are determined to be spurious.
+func TestBBRv3SpuriousRecoveryRequiresMajority(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// Set up in ProbeBW CRUISE state with known bounds
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.fullBandwidthReached = true
+	bbr.bwHi[0] = 1_000_000
+	bbr.minRTT = 20 * time.Millisecond
+	bbr.congestionWindow = 100_000
+
+	// Initialize bounds (pre-loss state)
+	bbr.bwLo = 800_000
+	bbr.inflightLo = 80_000
+	bbr.inflightHi = 120_000
+
+	// Send 4 packets of 1000 bytes each (total episode = 4000 bytes)
+	for i := protocol.PacketNumber(1); i <= 4; i++ {
+		bbr.OnPacketSent(now, protocol.ByteCount(i-1)*1000, i, 1000, true)
+		now = now.Add(time.Millisecond)
+	}
+
+	// Lose all 4 packets - triggers OnCongestionEvent and saves state
+	for i := protocol.PacketNumber(1); i <= 4; i++ {
+		bbr.OnCongestionEvent(i, 1000, 0)
+	}
+
+	// Verify loss was recorded
+	require.True(t, bbr.lossInRound, "lossInRound should be set")
+
+	// Trigger adaptLowerBounds by simulating loss round end
+	// This promotes pending losses to active episode and applies cuts
+	bbr.roundStart = true
+	bbr.lossRoundStart = true
+	bbr.bwLatest = 700_000
+	bbr.inflightLatest = 70_000
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	// Verify episode is active with 4000 total bytes
+	require.True(t, bbr.lossEpisodeActive, "loss episode should be active after cuts applied")
+	require.Equal(t, protocol.ByteCount(4000), bbr.lossEpisodeTotalBytes,
+		"episode should track 4000 total bytes lost")
+
+	// Bounds should now be reduced
+	reducedBwLo := bbr.bwLo
+	reducedInflightLo := bbr.inflightLo
+	require.Less(t, reducedBwLo, protocol.ByteCount(800_000), "bwLo should be reduced")
+	require.Less(t, reducedInflightLo, protocol.ByteCount(80_000), "inflightLo should be reduced")
+
+	// Mark only 1 packet (1000 bytes) as spurious - this is 25%, not majority
+	bbr.OnSpuriousLossDetected(1, 1)
+
+	// Bounds should NOT be restored yet (only 25% spurious, need >50%)
+	require.Equal(t, reducedBwLo, bbr.bwLo,
+		"bwLo should NOT be restored when <50%% of episode is spurious")
+	require.Equal(t, reducedInflightLo, bbr.inflightLo,
+		"inflightLo should NOT be restored when <50%% of episode is spurious")
+	require.Equal(t, protocol.ByteCount(1000), bbr.lossEpisodeSpuriousBytes,
+		"spurious bytes should be accumulated")
+	require.True(t, bbr.lossEpisodeActive, "episode should still be active")
+
+	// Mark second packet (1000 bytes) as spurious - now 50%, still not majority
+	bbr.OnSpuriousLossDetected(2, 2)
+
+	// 2000/4000 = 50% is NOT >50%, so still no restoration
+	require.Equal(t, reducedBwLo, bbr.bwLo,
+		"bwLo should NOT be restored at exactly 50%% (need >50%%)")
+	require.Equal(t, protocol.ByteCount(2000), bbr.lossEpisodeSpuriousBytes)
+
+	// Mark third packet (1000 bytes) as spurious - now 75%, this is majority
+	bbr.OnSpuriousLossDetected(3, 3)
+
+	// 3000/4000 = 75% > 50%, so restoration SHOULD happen now
+	// Using 2x comparison: 2*3000 = 6000 > 4000, so majority threshold met
+	require.Equal(t, protocol.ByteCount(800_000), bbr.bwLo,
+		"bwLo should be restored when >50%% of episode is spurious")
+	require.Equal(t, protocol.ByteCount(80_000), bbr.inflightLo,
+		"inflightLo should be restored when >50%% of episode is spurious")
+	require.False(t, bbr.lossEpisodeActive,
+		"episode should be cleared after restoration")
+	require.False(t, bbr.lossInRound,
+		"lossInRound should be cleared after spurious recovery")
 }
 
 // ############################################################################

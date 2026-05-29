@@ -558,6 +558,17 @@ type BBRv3 struct {
 	undoInflightHi   protocol.ByteCount
 	undoCwnd         protocol.ByteCount
 
+	// Loss episode tracking for RFC §5.5.11 spurious recovery.
+	// Per RFC, restoration only occurs when an entire recovery episode is
+	// determined to be spurious (>50% of episode bytes), not per-packet.
+	// Pending losses accumulate via OnCongestionEvent, then get promoted to
+	// an active episode when adaptLowerBounds applies cuts.
+	lossEpisodeActive        bool
+	lossEpisodePackets       map[protocol.PacketNumber]protocol.ByteCount
+	lossEpisodeTotalBytes    protocol.ByteCount
+	lossEpisodeSpuriousBytes protocol.ByteCount
+	pendingLossPackets       map[protocol.PacketNumber]protocol.ByteCount
+
 	// Round-level diagnostic accumulators for qlog telemetry.
 	// These track per-round statistics to diagnose filled-pipe estimator issues
 	// without requiring per-ACK event emission. Reset on each round boundary.
@@ -646,6 +657,8 @@ func (bbr *BBRv3) resetControllerState(initialMaxDatagramSize protocol.ByteCount
 	bbr.undoBwLo = protocol.MaxByteCount
 	bbr.undoInflightLo = protocol.MaxByteCount
 	bbr.undoInflightHi = protocol.MaxByteCount
+	// Episode state is zeroed by *bbr = BBRv3{} above, but explicitly note that
+	// lossEpisodeActive, lossEpisodePackets, pendingLossPackets are cleared.
 	if bbr.congestionWindow < bbr.minPipeCwnd {
 		bbr.congestionWindow = bbr.minPipeCwnd
 	}
@@ -868,6 +881,14 @@ func (bbr *BBRv3) OnCongestionEvent(
 			return
 		}
 	}
+
+	// Track pending losses for episode promotion in adaptLowerBounds.
+	// Per RFC §5.5.11, we track individual lost packets so that spurious
+	// recovery can use episode-level majority threshold (>50% spurious).
+	if bbr.pendingLossPackets == nil {
+		bbr.pendingLossPackets = make(map[protocol.PacketNumber]protocol.ByteCount)
+	}
+	bbr.pendingLossPackets[packetNumber] = lostBytes
 
 	bbr.totalBytesLost += uint64(lostBytes)
 	bbr.bytesLostInRound += lostBytes
@@ -1421,6 +1442,31 @@ func (bbr *BBRv3) adaptLowerBounds(bbrRateSample) {
 		cut := 1.0 - BETA_REDUCTION
 		bbr.bwLo = max(bbr.bwLatest, protocol.ByteCount(float64(bbr.bwLo)*cut))
 		bbr.inflightLo = max(bbr.inflightLatest, protocol.ByteCount(float64(bbr.inflightLo)*cut))
+
+		// Promote pending losses to active episode when cuts are applied.
+		// Per RFC §5.5.11, we track the loss episode so spurious recovery
+		// can use episode-level majority threshold (>50% spurious).
+		if len(bbr.pendingLossPackets) > 0 {
+			if !bbr.lossEpisodeActive {
+				// Start new episode
+				bbr.lossEpisodeActive = true
+				bbr.lossEpisodePackets = bbr.pendingLossPackets
+				bbr.lossEpisodeTotalBytes = 0
+				for _, bytes := range bbr.pendingLossPackets {
+					bbr.lossEpisodeTotalBytes += bytes
+				}
+				bbr.lossEpisodeSpuriousBytes = 0
+			} else {
+				// Merge into existing episode
+				for pn, bytes := range bbr.pendingLossPackets {
+					if _, exists := bbr.lossEpisodePackets[pn]; !exists {
+						bbr.lossEpisodePackets[pn] = bytes
+						bbr.lossEpisodeTotalBytes += bytes
+					}
+				}
+			}
+			bbr.pendingLossPackets = nil
+		}
 	}
 	if ecnInflightLo != protocol.MaxByteCount {
 		bbr.inflightLo = min(bbr.inflightLo, ecnInflightLo)
@@ -2011,28 +2057,43 @@ func (bbr *BBRv3) saveStateUponLoss() {
 	bbr.undoCwnd = bbr.congestionWindow
 }
 
-// OnSpuriousLossDetected reacts to spurious-loss signals at the per-packet
-// level. Draft-ietf-ccwg-bbr-05 §5.2.5 / §5.5.11 specify episode-level
-// semantics: the model should be undone only when an entire recovery episode
-// is determined to have been spurious, not on the first reordered packet.
+// OnSpuriousLossDetected implements RFC §5.5.11 episode-level spurious recovery.
+// The transport layer calls this for each packet determined to be spuriously lost.
+// Per RFC, restoration only occurs when >50% of episode bytes are spurious.
 //
-// Current behavior: first spurious packet triggers model restoration.
-// Spec behavior: wait until entire episode is determined spurious.
-//
-// Implementing the spec correctly requires sent_packet_handler to expose
-// recovery-episode boundaries (episode start, episode end, episode-was-spurious)
-// to the congestion controller. This is tracked as a follow-up item.
-//
-// Pinned by TestBBRv3SpuriousLossPinsPerPacketSemantics.
-func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.PacketNumber) {
-	// The current transport hook delivers one callback per spuriously lost
-	// packet, so thresholds greater than 1 effectively disable this recovery
-	// path until BBR grows an explicit accumulator.
-	if spuriousLossRecoveryThreshold > 1 {
+// The episode-level approach prevents over-aggressive restoration from isolated
+// reordering while still recovering when the majority of a loss episode was spurious.
+// This uses 2x comparison (2*spurious > total) to avoid integer division edge cases.
+func (bbr *BBRv3) OnSpuriousLossDetected(packetNumber protocol.PacketNumber, _ protocol.PacketNumber) {
+	// If no active episode, nothing to do (packet may have been lost before
+	// episode tracking was added, or episode was already cleared)
+	if !bbr.lossEpisodeActive {
 		return
 	}
 
-	// Clear loss-in-round flag since the loss was spurious
+	// Check if this packet is part of the active loss episode
+	bytes, inEpisode := bbr.lossEpisodePackets[packetNumber]
+	if !inEpisode {
+		return
+	}
+
+	// Accumulate spurious bytes and remove from episode tracking
+	bbr.lossEpisodeSpuriousBytes += bytes
+	delete(bbr.lossEpisodePackets, packetNumber)
+
+	// Check if majority threshold is met: >50% of episode bytes are spurious
+	// Using 2x comparison to avoid integer division edge case:
+	// spurious/total > 0.5 is equivalent to 2*spurious > total
+	if 2*bbr.lossEpisodeSpuriousBytes > bbr.lossEpisodeTotalBytes {
+		bbr.restoreBoundsForSpuriousEpisode()
+	}
+}
+
+// restoreBoundsForSpuriousEpisode restores BBRv3 model state after determining
+// that a loss episode was spurious (>50% of bytes were spuriously lost).
+// This preserves all restore behavior from the primary branch per RFC §5.5.11.2.
+func (bbr *BBRv3) restoreBoundsForSpuriousEpisode() {
+	// Clear loss-in-round flag since the episode was spurious
 	bbr.lossInRound = false
 
 	// Reset full bandwidth estimator to re-probe after spurious loss
@@ -2071,6 +2132,12 @@ func (bbr *BBRv3) OnSpuriousLossDetected(_ protocol.PacketNumber, _ protocol.Pac
 			bbr.startProbeBWUp(monotime.Now(), bbr.bwLatest)
 		}
 	}
+
+	// Clear episode state after restoration
+	bbr.lossEpisodeActive = false
+	bbr.lossEpisodePackets = nil
+	bbr.lossEpisodeTotalBytes = 0
+	bbr.lossEpisodeSpuriousBytes = 0
 
 	// Emit qlog event for debugging/analysis
 	if bbr.qlogger != nil {
