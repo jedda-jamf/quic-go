@@ -72,7 +72,11 @@ const (
 	maxAdaptiveReorderingThreshold = protocol.PacketNumber(1 << 14) // 16384
 	maxBDPScaledThreshold          = protocol.PacketNumber(256) // ngtcp2 cap
 
-	defaultReorderingShift = uint(2) // Initial: loss_delay = rtt + rtt/4 (1.25x)
+	// defaultReorderingShift = 2 gives initial loss delay of 1.25× RTT.
+	// This is intentionally more permissive than RFC 9002's 1.125× (9/8) to
+	// reduce spurious loss declarations on paths with moderate jitter.
+	// The threshold widens further (up to 2.0× RTT) on time-based spurious loss.
+	defaultReorderingShift = uint(2)
 	minReorderingShift     = uint(0) // Most permissive: loss_delay = 2*rtt
 )
 
@@ -1341,26 +1345,6 @@ func (h *sentPacketHandler) getPacketReorderingThreshold() protocol.PacketNumber
 	}
 
 	return min(threshold, maxAdaptiveReorderingThreshold)
-}
-
-// getTimeThreshold returns the effective time threshold multiplier.
-//
-// Implementation landscape:
-// - RFC 9002: fixed 9/8 (1.125x RTT)
-// - QUICHE: adaptive via reorderingShift, starts at 1.25x, widens to 2.0x
-//
-// Our choice: QUICHE-style adaptive, starting at 1.25x (slightly more
-// permissive than RFC 9002) and widening on time-based spurious loss.
-//
-// Note: Moving from RFC 9002's 9/8 to 1.25x is intentional. Must verify
-// via testing that this doesn't unacceptably delay real loss detection.
-func (h *sentPacketHandler) getTimeThreshold() float64 {
-	if !enableAdaptiveTimeThreshold {
-		return timeThreshold // RFC 9002 default: 9/8 = 1.125
-	}
-	// QUICHE-style: 1 + (1 >> shift)
-	// shift=2: 1.25, shift=1: 1.5, shift=0: 2.0
-	return 1.0 + (1.0 / float64(uint(1)<<h.reorderingShift))
 }
 
 // getLossDelay returns the time-based loss delay using QUICHE-style integer shift.

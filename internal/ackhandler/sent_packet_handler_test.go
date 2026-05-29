@@ -1822,19 +1822,6 @@ func TestAdaptiveThresholdCaps(t *testing.T) {
 	require.LessOrEqual(t, threshold, maxAdaptiveReorderingThreshold)
 }
 
-func TestAdaptiveTimeThreshold(t *testing.T) {
-	h := &sentPacketHandler{
-		reorderingShift: 2, // 1.25x
-	}
-	require.InDelta(t, 1.25, h.getTimeThreshold(), 0.01)
-
-	h.reorderingShift = 1 // 1.5x
-	require.InDelta(t, 1.5, h.getTimeThreshold(), 0.01)
-
-	h.reorderingShift = 0 // 2.0x
-	require.InDelta(t, 2.0, h.getTimeThreshold(), 0.01)
-}
-
 func TestGetLossDelayIntegerShift(t *testing.T) {
 	// Verify getLossDelay uses exact QUICHE-style integer shift: rtt + (rtt >> shift)
 	h := &sentPacketHandler{}
