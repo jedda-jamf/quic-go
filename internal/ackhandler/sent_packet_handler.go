@@ -65,7 +65,11 @@ const (
 	enableMonotonicThresholdGrowth = true  // threshold grows on spurious loss
 	enableAdaptiveTimeThreshold    = true  // QUICHE-style reorderingShift
 
-	maxAdaptiveReorderingThreshold = protocol.PacketNumber(300) // QUICHE kMaxPacketReorderingThreshold
+	// maxAdaptiveReorderingThreshold is a quic-go safety bound (NOT a QUICHE port).
+	// QUICHE has no cap; we add this to prevent pathological paths from deferring
+	// loss detection indefinitely. Set high enough to never interfere with realistic
+	// reordering but low enough to catch pathological cases.
+	maxAdaptiveReorderingThreshold = protocol.PacketNumber(1 << 14) // 16384
 	maxBDPScaledThreshold          = protocol.PacketNumber(256) // ngtcp2 cap
 
 	defaultReorderingShift = uint(2) // Initial: loss_delay = rtt + rtt/4 (1.25x)
