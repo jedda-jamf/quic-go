@@ -2072,7 +2072,7 @@ func (bbr *BBRv3) saveStateUponLoss() {
 // The episode-level approach prevents over-aggressive restoration from isolated
 // reordering while still recovering when the majority of a loss episode was spurious.
 // This uses 2x comparison (2*spurious > total) to avoid integer division edge cases.
-func (bbr *BBRv3) OnSpuriousLossDetected(packetNumber protocol.PacketNumber, _ protocol.PacketNumber) {
+func (bbr *BBRv3) OnSpuriousLossDetected(packetNumber protocol.PacketNumber, _ protocol.PacketNumber, _ protocol.ByteCount) {
 	// If no active episode, nothing to do (packet may have been lost before
 	// episode tracking was added, or episode was already cleared)
 	if !bbr.lossEpisodeActive {
