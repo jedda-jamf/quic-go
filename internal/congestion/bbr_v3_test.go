@@ -1841,6 +1841,50 @@ func TestBBRv3CheckFullBwReachedCountOnlyAtRoundStart(t *testing.T) {
 		"round-start no-growth samples must increment counter")
 }
 
+// TestBBRv3StartupExitsWithSuppressedRoundStartSamples verifies that the plateau
+// counter advances even when round-start samples are suppressed (deliveryRate=0)
+// due to interval < min_rtt. This prevents Startup from stalling on high-RTT paths
+// where every round-start sample is suppressed.
+//
+// Background: The delivery rate sampler sets deliveryRate=0 when the sample
+// interval is less than min_rtt (to avoid noisy estimates). At high RTT, this
+// can affect round-start samples. The previous code had a guard that returned
+// early on deliveryRate==0, which prevented the plateau counter from advancing.
+//
+// The fix removes the deliveryRate==0 guard. Suppressed samples (rate 0) still
+// cannot exceed the 1.25x growth threshold, so they don't reset the baseline,
+// and the plateau counter correctly advances at round boundaries.
+//
+// Ref: tcp_bbr.c line 1935 (bbr_check_full_bw_reached does not guard on rate==0)
+// Fixes: F4 High-RTT Startup stall
+func TestBBRv3StartupExitsWithSuppressedRoundStartSamples(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRStartup
+	bbr.minRTT = 100 * time.Millisecond
+	bbr.bwHi[0] = 100_000_000
+	bbr.fullBandwidth = 100_000_000 // Baseline from first valid sample
+
+	// Simulate 3 rounds where round-start samples are suppressed (rate=0)
+	// but no growth is occurring. Counter should still advance at each round.
+	for round := 0; round < FULL_BW_ROUNDS; round++ {
+		bbr.roundStart = true
+		// Suppressed round-start sample: rate=0 because interval < min_rtt
+		rs := bbrRateSample{
+			deliveryRate: 0, // Suppressed due to short interval
+			interval:     50 * time.Millisecond,
+		}
+		bbr.checkFullBwReached(rs)
+		require.Equal(t, round+1, bbr.fullBandwidthCount,
+			"plateau counter should advance on suppressed sample (round %d)", round)
+	}
+
+	require.True(t, bbr.fullBandwidthReached,
+		"should have reached full bandwidth after %d rounds with suppressed samples",
+		FULL_BW_ROUNDS)
+	require.True(t, bbr.fullBandwidthNow,
+		"fullBandwidthNow should be set when plateau count reaches threshold")
+}
+
 func TestBBRv3StartupExitByExcessiveLoss(t *testing.T) {
 	bbr := newTestBBRv3()
 	bbr.state = BBRStartup

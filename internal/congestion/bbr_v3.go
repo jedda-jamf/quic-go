@@ -1570,7 +1570,7 @@ func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
 	if bbr.state != BBRStartup {
 		return
 	}
-	if bbr.fullBandwidthNow || rs.isAppLimited || rs.deliveryRate == 0 {
+	if bbr.fullBandwidthNow || rs.isAppLimited {
 		return
 	}
 	// Growth check runs on every valid ACK (not gated on roundStart).
