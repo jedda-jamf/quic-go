@@ -293,7 +293,7 @@ func TestSentPacketHandlerUsesOptionalPacketReorderingHooks(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, acked)
 	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)
-	require.Equal(t, []protocol.PacketNumber{6}, cong.spuriousReordering)
+	require.Equal(t, []protocol.PacketNumber{5}, cong.spuriousReordering)
 }
 
 func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
@@ -325,14 +325,16 @@ func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
 
 	handler := sph.(*sentPacketHandler)
 	handler.lostPackets.Add(0, firstSendTime, 1200)
-	handler.detectSpuriousLosses(
-		&wire.AckFrame{
-			AckRanges: []wire.AckRange{
-				{Smallest: 4, Largest: 4},
-				{Smallest: 0, Largest: 0},
-			},
+	ackFrame := &wire.AckFrame{
+		AckRanges: []wire.AckRange{
+			{Smallest: 4, Largest: 4},
+			{Smallest: 0, Largest: 0},
 		},
+	}
+	handler.detectSpuriousLosses(
+		ackFrame,
 		now.Add(10*time.Millisecond),
+		ackFrame.LargestAcked(),
 	)
 
 	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)

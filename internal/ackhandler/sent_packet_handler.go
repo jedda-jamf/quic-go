@@ -530,6 +530,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
+	previousLargestAcked := pnSpace.largestAcked
 	pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
 
 	if lossStart, ok := h.congestion.(congestion.LossDetectionHandler); ok {
@@ -568,6 +569,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.detectSpuriousLosses(
 			ack,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
+			previousLargestAcked,
 		)
 		// clean up lost packet history
 		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
@@ -606,7 +608,7 @@ func ackedBytesInFlight(ackedPackets []packetWithPacketNumber) protocol.ByteCoun
 	return acked
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time, previousLargestAcked protocol.PacketNumber) {
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
@@ -631,7 +633,9 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			return true // continue
 		}
 		if pn <= ackRange.Largest {
-			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
+			// Use previous_largest_acked per QUICHE SpuriousLossDetected logic.
+			// history.Difference accounts for skipped packet numbers.
+			packetReordering := h.appDataPackets.history.Difference(previousLargestAcked, pn)
 			timeReordering := ackTime.Sub(sendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
 			maxTimeReordering = max(maxTimeReordering, timeReordering)

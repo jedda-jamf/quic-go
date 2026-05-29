@@ -1717,16 +1717,16 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	spuriousEvents := eventRecorder.Events(qlog.SpuriousLoss{})
 	require.Len(t, spuriousEvents, 2, "should have 2 spurious loss events for pn1 and pn2")
 
-	// Packet reordering is calculated from ack.LargestAcked() (pn4) to the lost packet
+	// Packet reordering is calculated from previous_largest_acked (pn3, before pn4 was acked) to the lost packet
 	sl1 := spuriousEvents[0].(qlog.SpuriousLoss)
 	require.Equal(t, pn1, sl1.PacketNumber)
 	require.Equal(t, protocol.Encryption1RTT, sl1.EncryptionLevel)
-	require.Equal(t, uint64(pn4-pn1), sl1.PacketReordering, "packet reordering for pn1")
+	require.Equal(t, uint64(pn3-pn1), sl1.PacketReordering, "packet reordering for pn1")
 	require.Equal(t, ackTime1.Sub(pn1SendTime), sl1.TimeReordering, "time reordering for pn1")
 
 	sl2 := spuriousEvents[1].(qlog.SpuriousLoss)
 	require.Equal(t, pn2, sl2.PacketNumber)
-	require.Equal(t, uint64(pn4-pn2), sl2.PacketReordering, "packet reordering for pn2")
+	require.Equal(t, uint64(pn3-pn2), sl2.PacketReordering, "packet reordering for pn2")
 	require.Equal(t, ackTime1.Sub(pn2SendTime), sl2.TimeReordering, "time reordering for pn2")
 
 	eventRecorder.Clear()
@@ -1778,7 +1778,7 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 
 	sl5 := spuriousEvents[0].(qlog.SpuriousLoss)
 	require.Equal(t, pn5, sl5.PacketNumber)
-	require.Equal(t, uint64(pn7-pn5), sl5.PacketReordering)
+	require.Equal(t, uint64(pn6-pn5), sl5.PacketReordering)
 	require.Equal(t, ackTime2.Sub(pn5SendTime), sl5.TimeReordering)
 }
 
