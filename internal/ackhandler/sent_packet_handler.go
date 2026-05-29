@@ -442,6 +442,9 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		if h.ecnTracker != nil {
 			congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 			if congested {
+				// ECN congestion signal. BBRv3 early-returns on lostBytes==0 because
+				// it consumes ECN via OnECNFeedback instead. This call is retained for
+				// CCs that handle ECN through the loss path (e.g., NewReno/Cubic).
 				h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
 			}
 		}
@@ -486,7 +489,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		ackEvents.OnAckEventEnd(rcvTime)
 	}
 
-	// detect spurious losses for application data packets, if the ACK was not reordered
+	// detect spurious losses for application data packets, if the ACK was not reordered.
+	// detectSpuriousLosses only runs when this ACK advanced largestAcked.
+	// Spurious-loss signals are suppressed for reordered ACKs — this is
+	// intentional since the reordering regime triggers threshold adaptation
+	// through the normal loss path, not through spurious detection.
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
 		h.detectSpuriousLosses(
 			ack,
