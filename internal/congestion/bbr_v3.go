@@ -565,6 +565,15 @@ type BBRv3 struct {
 	suppressedSamplesInRound uint32             // ACKs where interval < min_rtt caused suppression
 	maxDeliveryRateInRound   protocol.ByteCount // Highest valid deliveryRate this round
 	totalAckEventsInRound    uint32             // Total ACK events processed this round
+
+	// F1 instrumentation: loss-cut trajectory tracking
+	suppressedLossRoundStarts uint32             // Suppressed samples at loss_round_start
+	cutSnapshotRound          uint64             // Round when snapshot was taken
+	bwLatestBeforeCut         protocol.ByteCount // bw_latest before adaptLowerBounds
+	bwLoBeforeCut             protocol.ByteCount // bw_lo before adaptLowerBounds
+	inflightLoBeforeCut       protocol.ByteCount // inflight_lo before adaptLowerBounds
+	bwLoAfterCut              protocol.ByteCount // bw_lo after adaptLowerBounds
+	inflightLoAfterCut        protocol.ByteCount // inflight_lo after adaptLowerBounds
 }
 
 var (
@@ -1315,6 +1324,10 @@ func (bbr *BBRv3) updateLatestDeliverySignals(rs bbrRateSample) {
 	if rs.priorDelivered >= bbr.lossRoundDelivered {
 		bbr.lossRoundDelivered = bbr.totalBytesAcked
 		bbr.lossRoundStart = true
+		// Track suppressed samples at loss round start for F1 instrumentation
+		if rs.deliveryRate == 0 {
+			bbr.suppressedLossRoundStarts++
+		}
 	}
 }
 
@@ -1326,6 +1339,8 @@ func (bbr *BBRv3) advanceLatestDeliverySignals(rs bbrRateSample) {
 		}
 		bbr.inflightLatest = rs.delivered
 		bbr.bytesLostInRound = 0
+		// Reset F1 instrumentation counters
+		bbr.suppressedLossRoundStarts = 0
 	}
 }
 
@@ -1340,7 +1355,34 @@ func (bbr *BBRv3) updateCongestionSignals(rs bbrRateSample) {
 	if !bbr.lossRoundStart {
 		return
 	}
+	// F1 instrumentation: capture before-cut values
+	bbr.bwLatestBeforeCut = bbr.bwLatest
+	if bbr.bwLo != protocol.MaxByteCount {
+		bbr.bwLoBeforeCut = bbr.bwLo
+	} else {
+		bbr.bwLoBeforeCut = 0
+	}
+	if bbr.inflightLo != protocol.MaxByteCount {
+		bbr.inflightLoBeforeCut = bbr.inflightLo
+	} else {
+		bbr.inflightLoBeforeCut = 0
+	}
+
 	bbr.adaptLowerBounds(rs)
+
+	// F1 instrumentation: capture after-cut values
+	if bbr.bwLo != protocol.MaxByteCount {
+		bbr.bwLoAfterCut = bbr.bwLo
+	} else {
+		bbr.bwLoAfterCut = 0
+	}
+	if bbr.inflightLo != protocol.MaxByteCount {
+		bbr.inflightLoAfterCut = bbr.inflightLo
+	} else {
+		bbr.inflightLoAfterCut = 0
+	}
+	bbr.cutSnapshotRound = bbr.roundCount
+
 	bbr.lossInRound = false
 	bbr.ecnInRound = false
 }
@@ -2559,6 +2601,13 @@ func (bbr *BBRv3) qlogRoundUpdate(rs bbrRateSample) qlog.BBRv3RoundUpdated {
 		SuppressedSamplesInRound: bbr.suppressedSamplesInRound,
 		MaxDeliveryRateInRound:   uint64(bbr.maxDeliveryRateInRound),
 		TotalAckEventsInRound:    bbr.totalAckEventsInRound,
+		// F1 instrumentation: loss-cut trajectory tracking
+		SuppressedSamplesAtLossRoundStart: uint32(bbr.suppressedLossRoundStarts),
+		BwLatestBeforeCut:                 uint64(bbr.bwLatestBeforeCut),
+		BwLoBeforeCut:                     uint64(bbr.bwLoBeforeCut),
+		InflightLoBeforeCut:               uint64(bbr.inflightLoBeforeCut),
+		BwLoAfterCut:                      uint64(bbr.bwLoAfterCut),
+		InflightLoAfterCut:                uint64(bbr.inflightLoAfterCut),
 	}
 }
 

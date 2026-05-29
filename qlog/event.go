@@ -974,6 +974,13 @@ type BBRv3RoundUpdated struct {
 	SuppressedSamplesInRound uint32        // ACK events where interval < min_rtt
 	MaxDeliveryRateInRound   uint64        // Highest valid deliveryRate this round
 	TotalAckEventsInRound    uint32        // Total ACK events processed this round
+	// F1 instrumentation: loss-cut trajectory tracking
+	SuppressedSamplesAtLossRoundStart uint32 // Suppressed samples that coincided with loss_round_start
+	BwLatestBeforeCut                 uint64 // bw_latest before adaptLowerBounds (bytes/sec)
+	BwLoBeforeCut                     uint64 // bw_lo before adaptLowerBounds (bytes/sec)
+	InflightLoBeforeCut               uint64 // inflight_lo before adaptLowerBounds (bytes)
+	BwLoAfterCut                      uint64 // bw_lo after adaptLowerBounds (bytes/sec)
+	InflightLoAfterCut                uint64 // inflight_lo after adaptLowerBounds (bytes)
 }
 
 func (e BBRv3RoundUpdated) Name() string { return "recovery:bbr_round_updated" }
@@ -1038,6 +1045,30 @@ func (e BBRv3RoundUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	h.WriteToken(jsontext.Uint(e.MaxDeliveryRateInRound))
 	h.WriteToken(jsontext.String("total_ack_events_in_round"))
 	h.WriteToken(jsontext.Uint(uint64(e.TotalAckEventsInRound)))
+	if e.SuppressedSamplesAtLossRoundStart > 0 {
+		h.WriteToken(jsontext.String("suppressed_samples_at_loss_round_start"))
+		h.WriteToken(jsontext.Uint(uint64(e.SuppressedSamplesAtLossRoundStart)))
+	}
+	if e.BwLatestBeforeCut > 0 {
+		h.WriteToken(jsontext.String("bw_latest_before_cut"))
+		h.WriteToken(jsontext.Uint(e.BwLatestBeforeCut))
+	}
+	if e.BwLoBeforeCut > 0 {
+		h.WriteToken(jsontext.String("bw_lo_before_cut"))
+		h.WriteToken(jsontext.Uint(e.BwLoBeforeCut))
+	}
+	if e.InflightLoBeforeCut > 0 {
+		h.WriteToken(jsontext.String("inflight_lo_before_cut"))
+		h.WriteToken(jsontext.Uint(e.InflightLoBeforeCut))
+	}
+	if e.BwLoAfterCut > 0 {
+		h.WriteToken(jsontext.String("bw_lo_after_cut"))
+		h.WriteToken(jsontext.Uint(e.BwLoAfterCut))
+	}
+	if e.InflightLoAfterCut > 0 {
+		h.WriteToken(jsontext.String("inflight_lo_after_cut"))
+		h.WriteToken(jsontext.Uint(e.InflightLoAfterCut))
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
