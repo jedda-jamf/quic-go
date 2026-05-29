@@ -62,8 +62,8 @@ const (
 	// - BDP-scaling doesn't capture persistent path-specific reordering patterns
 
 	enableBDPScaledThreshold       = true  // threshold = bytesInFlight / mtu / 2
-	enableMonotonicThresholdGrowth = true  // threshold grows on spurious loss
-	enableAdaptiveTimeThreshold    = true  // QUICHE-style reorderingShift
+	enableMonotonicThresholdGrowth = false // threshold grows on spurious loss
+	enableAdaptiveTimeThreshold    = false // QUICHE-style reorderingShift
 
 	// maxAdaptiveReorderingThreshold is a quic-go safety bound (NOT a QUICHE port).
 	// QUICHE has no cap; we add this to prevent pathological paths from deferring
