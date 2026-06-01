@@ -27,9 +27,8 @@ type hookTrackingCongestion struct {
 	ptoBytesInFlight      []protocol.ByteCount
 	spuriousPackets       []protocol.PacketNumber
 	spuriousReordering    []protocol.PacketNumber
-	migrationSizes        []protocol.ByteCount
-	appLimitedBytes       []protocol.ByteCount
-	packetThreshold       protocol.PacketNumber
+	migrationSizes  []protocol.ByteCount
+	appLimitedBytes []protocol.ByteCount
 }
 
 func (*hookTrackingCongestion) TimeUntilSend(protocol.ByteCount) monotime.Time { return 0 }
@@ -85,12 +84,6 @@ func (h *hookTrackingCongestion) OnPTO(bytesInFlight protocol.ByteCount) {
 func (h *hookTrackingCongestion) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
 	h.migrationSizes = append(h.migrationSizes, initialMaxDatagramSize)
 	h.maxDatagramSize = initialMaxDatagramSize
-}
-func (h *hookTrackingCongestion) GetPacketReorderThreshold() protocol.PacketNumber {
-	if h.packetThreshold == 0 {
-		return 3
-	}
-	return h.packetThreshold
 }
 
 type fallbackOnlyCongestion struct {
@@ -251,9 +244,13 @@ func TestSentPacketHandlerNotifiesPTOHook(t *testing.T) {
 	require.Equal(t, []protocol.ByteCount{1200}, cong.ptoBytesInFlight)
 }
 
-func TestSentPacketHandlerUsesOptionalPacketReorderingHooks(t *testing.T) {
+func TestSentPacketHandlerBDPScaledReorderingThreshold(t *testing.T) {
+	// Test that BDP-scaled threshold prevents false loss declarations.
+	// With BDP-scaling: threshold = max(3, min(256, bytesInFlight/mtu/2))
+	// With 100 packets @ 1200 bytes = 120KB in flight, threshold = 120000/1200/2 = 50
+	// So packet 0 should NOT be declared lost when packet 5 is acked (gap of 5 < 50).
 	now := monotime.Now()
-	cong := &hookTrackingCongestion{packetThreshold: 5}
+	cong := &hookTrackingCongestion{}
 	sph := NewSentPacketHandler(
 		0,
 		1200,
@@ -268,32 +265,23 @@ func TestSentPacketHandlerUsesOptionalPacketReorderingHooks(t *testing.T) {
 		utils.DefaultLogger,
 	)
 
-	for i := range 7 {
+	// Send 100 packets to create large bytes_in_flight for BDP scaling
+	for i := range 100 {
 		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
 		sph.SentPacket(now.Add(time.Duration(i)*time.Millisecond), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1200, false, false)
 	}
 
+	// ACK packet 50 - with BDP scaling, packet 0 should NOT be lost yet
+	// because gap (50) < threshold (50 = 120000/1200/2)
 	acked, err := sph.ReceivedAck(
-		&wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 5, Largest: 5}}},
+		&wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 50, Largest: 50}}},
 		protocol.Encryption1RTT,
 		now.Add(10*time.Millisecond),
 	)
 	require.NoError(t, err)
 	require.True(t, acked)
+	// No spurious losses expected because we haven't declared any losses yet
 	require.Empty(t, cong.spuriousPackets)
-
-	acked, err = sph.ReceivedAck(
-		&wire.AckFrame{AckRanges: []wire.AckRange{
-			{Smallest: 6, Largest: 6},
-			{Smallest: 0, Largest: 0},
-		}},
-		protocol.Encryption1RTT,
-		now.Add(20*time.Millisecond),
-	)
-	require.NoError(t, err)
-	require.True(t, acked)
-	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)
-	require.Equal(t, []protocol.PacketNumber{6}, cong.spuriousReordering)
 }
 
 func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {

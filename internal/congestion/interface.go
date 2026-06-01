@@ -69,12 +69,6 @@ type SpuriousLossHandler interface {
 	OnSpuriousLossDetected(packetNumber protocol.PacketNumber, packetReordering protocol.PacketNumber)
 }
 
-// PacketReorderingThresholdProvider is implemented by congestion controllers
-// that want to override the default RFC 9002 packet reordering threshold.
-type PacketReorderingThresholdProvider interface {
-	GetPacketReorderThreshold() protocol.PacketNumber
-}
-
 // PTOHandler is implemented by congestion controllers that want an explicit
 // QUIC PTO signal with live inflight.
 type PTOHandler interface {

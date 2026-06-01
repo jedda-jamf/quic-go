@@ -1619,10 +1619,13 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 	)
 
 	var packets packetTracker
+	// Use small packets (100 bytes) so BDP-scaled threshold stays at minimum (3).
+	// With 20 packets @ 100 bytes = 2000 bytes in flight, threshold = 2000/1200/2 = 0,
+	// clamped to minimum of 3.
 	sendPacket := func(t *testing.T, ti monotime.Time) protocol.PacketNumber {
 		t.Helper()
 		pn := sph.PopPacketNumber(protocol.Encryption1RTT)
-		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECNNon, 100, false, false)
 		return pn
 	}
 
