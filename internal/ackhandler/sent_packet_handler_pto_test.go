@@ -32,7 +32,7 @@ func (*ptoTrackingSendAlgorithm) InRecovery() bool                      { return
 func (*ptoTrackingSendAlgorithm) GetCongestionWindow() protocol.ByteCount {
 	return 32 * 1200
 }
-func (c *ptoTrackingSendAlgorithm) OnPTO(bytesInFlight protocol.ByteCount) {
+func (c *ptoTrackingSendAlgorithm) OnPTO(_ monotime.Time, bytesInFlight protocol.ByteCount) {
 	c.ptoInflight = append(c.ptoInflight, bytesInFlight)
 }
 

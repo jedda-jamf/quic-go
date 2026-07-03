@@ -74,9 +74,11 @@ type SpuriousLossHandler interface {
 }
 
 // PTOHandler is implemented by congestion controllers that want an explicit
-// QUIC PTO signal with live inflight.
+// QUIC PTO signal with live inflight. now is the time the PTO timer fired;
+// controllers use it to validate that later-delivered data was sent after
+// the PTO before restoring pre-PTO state (cf. RFC 9002 PTO semantics).
 type PTOHandler interface {
-	OnPTO(bytesInFlight protocol.ByteCount)
+	OnPTO(now monotime.Time, bytesInFlight protocol.ByteCount)
 }
 
 // ConnectionMigrationHandler is implemented by custom congestion controllers

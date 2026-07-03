@@ -78,7 +78,7 @@ func (h *hookTrackingCongestion) OnSpuriousLossDetected(packetNumber, packetReor
 	h.spuriousPackets = append(h.spuriousPackets, packetNumber)
 	h.spuriousReordering = append(h.spuriousReordering, packetReordering)
 }
-func (h *hookTrackingCongestion) OnPTO(bytesInFlight protocol.ByteCount) {
+func (h *hookTrackingCongestion) OnPTO(_ monotime.Time, bytesInFlight protocol.ByteCount) {
 	h.ptoBytesInFlight = append(h.ptoBytesInFlight, bytesInFlight)
 }
 func (h *hookTrackingCongestion) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {

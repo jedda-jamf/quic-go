@@ -477,6 +477,12 @@ type BBRv3 struct {
 	priorCwnd   protocol.ByteCount
 	idleRestart bool
 	ptoRecovery bool
+	// ptoStamp is the fire time of the PTO that began the current PTO
+	// recovery. The saved priorCwnd is only restored once delivered data
+	// includes a packet sent after this time — RFC 9002-style PTO
+	// validation, so a genuinely broken path cannot trigger an instant
+	// full-cwnd burst from a delayed pre-PTO ACK (review F3.2, 2026-07-03).
+	ptoStamp monotime.Time
 
 	cycleStamp        monotime.Time
 	phaseStartStamp   monotime.Time
@@ -940,15 +946,16 @@ func (bbr *BBRv3) OnRetransmissionTimeout(_ bool) {
 	// is OnPTO, which receives bytesInFlight from the ackhandler.
 }
 
-func (bbr *BBRv3) OnPTO(bytesInFlight protocol.ByteCount) {
-	bbr.enterTimeoutRecovery(bytesInFlight)
+func (bbr *BBRv3) OnPTO(now monotime.Time, bytesInFlight protocol.ByteCount) {
+	bbr.enterTimeoutRecovery(now, bytesInFlight)
 }
 
-func (bbr *BBRv3) enterTimeoutRecovery(bytesInFlight protocol.ByteCount) {
+func (bbr *BBRv3) enterTimeoutRecovery(now monotime.Time, bytesInFlight protocol.ByteCount) {
 	if !bbr.ptoRecovery {
 		bbr.saveCwnd()
 		bbr.saveStateUponLoss()
 		bbr.ptoRecovery = true
+		bbr.ptoStamp = now
 	} else {
 		bbr.priorCwnd = max(bbr.priorCwnd, bbr.congestionWindow)
 	}
@@ -1203,7 +1210,24 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 
 	if rs.delivered > 0 {
 		bbr.idleRestart = false
-		bbr.ptoRecovery = false
+		// Exit PTO recovery and restore the saved cwnd once delivered data
+		// includes a packet sent after the PTO fired (RFC 9002-style PTO
+		// validation). Mirrors §5.6.4.4 / tcp_bbr.c bbr_exit_loss_recovery():
+		// cwnd = max(cwnd, prior_cwnd), then re-bound by the current inflight
+		// model (review F3.2, 2026-07-03). A delayed ACK for pre-PTO data —
+		// the spurious-PTO case — keeps recovery open until the PTO probes
+		// themselves are acknowledged.
+		// In ProbeRTT, only the flag is cleared: priorCwnd is preserved and
+		// checkProbeRTTDone performs its own restoreCwnd on ProbeRTT exit,
+		// so restoring here would overshoot the ProbeRTT cwnd cap.
+		if bbr.ptoRecovery && !bbr.pendingNewestSentTime.IsZero() &&
+			bbr.pendingNewestSentTime.After(bbr.ptoStamp) {
+			bbr.ptoRecovery = false
+			if bbr.state != BBRProbeRTT {
+				bbr.restoreCwnd()
+				bbr.boundCwndForInflightModel()
+			}
+		}
 	}
 	// RFC §4.1.2.3 UpdateRateSample(): after processing the newest packet in the
 	// ACK event, C.first_send_time becomes that packet's send_time. Future packets

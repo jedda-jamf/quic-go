@@ -1076,7 +1076,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
 	}
 	if timeoutHandler, ok := h.congestion.(congestion.PTOHandler); ok && h.bytesInFlight > 0 {
-		timeoutHandler.OnPTO(h.bytesInFlight)
+		timeoutHandler.OnPTO(now, h.bytesInFlight)
 	}
 	h.numProbesToSend += 2
 	//nolint:exhaustive // We never arm a PTO timer for 0-RTT packets.

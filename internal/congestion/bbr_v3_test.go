@@ -1109,15 +1109,63 @@ func TestBBRv3PTORecoveryUsesInflightAndPreservesPriorCwnd(t *testing.T) {
 	bbr.congestionWindow = 20 * bbr.maxDatagramSize
 	initialCwnd := bbr.congestionWindow
 
-	bbr.OnPTO(8 * bbr.maxDatagramSize)
+	now := monotime.Now()
+	bbr.OnPTO(now, 8*bbr.maxDatagramSize)
 	require.True(t, bbr.ptoRecovery)
+	require.Equal(t, now, bbr.ptoStamp)
 	require.Equal(t, initialCwnd, bbr.priorCwnd)
 	require.Equal(t, 9*bbr.maxDatagramSize, bbr.congestionWindow)
 	require.Equal(t, BBRProbeBW, bbr.undoState)
 
-	bbr.OnPTO(2 * bbr.maxDatagramSize)
+	bbr.OnPTO(now.Add(time.Second), 2*bbr.maxDatagramSize)
 	require.Equal(t, initialCwnd, bbr.priorCwnd)
+	require.Equal(t, now, bbr.ptoStamp,
+		"ptoStamp is pinned to the PTO that began the recovery episode")
 	require.Equal(t, 3*bbr.maxDatagramSize, bbr.congestionWindow)
+}
+
+// TestBBRv3PTORecoveryRestoresCwndOnPostPTOAck is the regression test for
+// review finding F3.2 (2026-07-03): after a PTO collapses cwnd to
+// inflight + 1*SMSS, the saved priorCwnd must be restored on recovery exit
+// (§5.6.4.4 / tcp_bbr.c bbr_exit_loss_recovery), and the exit must be gated
+// on delivering a packet sent after the PTO fired — a delayed ACK for
+// pre-PTO data must not restore cwnd on a possibly-broken path.
+func TestBBRv3PTORecoveryRestoresCwndOnPostPTOAck(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+	bbr.congestionWindow = 80_000
+
+	// Pre-PTO packet in flight.
+	bbr.OnPacketSent(now, 10_000, 1, 10_000, true)
+
+	// PTO fires: cwnd collapses, prior cwnd saved.
+	ptoTime := now.Add(50 * time.Millisecond)
+	bbr.OnPTO(ptoTime, 10_000)
+	require.Equal(t, protocol.ByteCount(80_000), bbr.priorCwnd)
+	require.Less(t, bbr.congestionWindow, protocol.ByteCount(80_000))
+
+	// PTO probe retransmission, sent after the PTO.
+	bbr.OnPacketSent(ptoTime.Add(time.Millisecond), 20_000, 2, 10_000, true)
+
+	// A delayed ACK for the pre-PTO packet arrives: delivered > 0, but the
+	// newest delivered packet was sent before the PTO — recovery stays open
+	// and cwnd is not restored.
+	ack1 := ptoTime.Add(5 * time.Millisecond)
+	bbr.OnPacketAcked(1, 10_000, 20_000, ack1)
+	bbr.OnAckEventEnd(ack1)
+	require.True(t, bbr.ptoRecovery,
+		"a pre-PTO ACK must not exit PTO recovery (RFC 9002-style validation)")
+	require.Less(t, bbr.congestionWindow, protocol.ByteCount(80_000),
+		"cwnd must not be restored by a pre-PTO ACK")
+
+	// The PTO probe itself is acknowledged: recovery exits and cwnd is
+	// restored to at least the saved priorCwnd.
+	ack2 := ptoTime.Add(15 * time.Millisecond)
+	bbr.OnPacketAcked(2, 10_000, 10_000, ack2)
+	bbr.OnAckEventEnd(ack2)
+	require.False(t, bbr.ptoRecovery)
+	require.GreaterOrEqual(t, bbr.congestionWindow, protocol.ByteCount(80_000),
+		"cwnd must be restored to priorCwnd on PTO recovery exit")
 }
 
 func TestBBRv3PacerMultiplierCompensation(t *testing.T) {
