@@ -263,6 +263,11 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 	if h.perspective == protocol.PerspectiveClient && encLevel == protocol.EncryptionHandshake {
 		h.peerCompletedAddressValidation = true
 	}
+	// Congestion controllers with per-packet state (e.g. BBRv3's delivery
+	// sampler) must forget dropped packets: they are neither acked nor lost,
+	// and stale entries keyed by raw PN would misclassify later 1-RTT packets
+	// reusing the same raw PN as PN-space collisions (review F7, 2026-07-03).
+	discarder, hasDiscarder := h.congestion.(congestion.PacketDiscardHandler)
 	// remove outstanding packets from bytes_in_flight
 	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
 		pnSpace := h.getPacketNumberSpace(encLevel)
@@ -270,8 +275,11 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		if pnSpace == nil {
 			return
 		}
-		for _, p := range pnSpace.history.Packets() {
+		for pn, p := range pnSpace.history.Packets() {
 			h.removeFromBytesInFlight(p)
+			if hasDiscarder {
+				discarder.OnPacketDiscarded(pn)
+			}
 		}
 	}
 	// drop the packet history
@@ -295,6 +303,9 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 			}
 			h.removeFromBytesInFlight(p)
 			h.appDataPackets.history.Remove(pn)
+			if hasDiscarder {
+				discarder.OnPacketDiscarded(pn)
+			}
 		}
 	default:
 		panic(fmt.Sprintf("Cannot drop keys for encryption level %s", encLevel))

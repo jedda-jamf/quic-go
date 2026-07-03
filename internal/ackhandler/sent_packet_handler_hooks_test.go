@@ -27,8 +27,9 @@ type hookTrackingCongestion struct {
 	ptoBytesInFlight      []protocol.ByteCount
 	spuriousPackets       []protocol.PacketNumber
 	spuriousReordering    []protocol.PacketNumber
-	migrationSizes  []protocol.ByteCount
-	appLimitedBytes []protocol.ByteCount
+	migrationSizes   []protocol.ByteCount
+	appLimitedBytes  []protocol.ByteCount
+	discardedPackets []protocol.PacketNumber
 }
 
 func (*hookTrackingCongestion) TimeUntilSend(protocol.ByteCount) monotime.Time { return 0 }
@@ -80,6 +81,9 @@ func (h *hookTrackingCongestion) OnSpuriousLossDetected(packetNumber, packetReor
 }
 func (h *hookTrackingCongestion) OnPTO(_ monotime.Time, bytesInFlight protocol.ByteCount) {
 	h.ptoBytesInFlight = append(h.ptoBytesInFlight, bytesInFlight)
+}
+func (h *hookTrackingCongestion) OnPacketDiscarded(pn protocol.PacketNumber) {
+	h.discardedPackets = append(h.discardedPackets, pn)
 }
 func (h *hookTrackingCongestion) OnConnectionMigration(initialMaxDatagramSize protocol.ByteCount) {
 	h.migrationSizes = append(h.migrationSizes, initialMaxDatagramSize)
@@ -325,4 +329,37 @@ func TestSentPacketHandlerNotifiesSpuriousLossHook(t *testing.T) {
 
 	require.Equal(t, []protocol.PacketNumber{0}, cong.spuriousPackets)
 	require.Equal(t, []protocol.PacketNumber{4}, cong.spuriousReordering)
+}
+
+// TestSentPacketHandlerDropPacketsNotifiesDiscardHandler verifies that
+// dropping a packet number space forwards the outstanding (neither acked nor
+// lost) packet numbers to congestion controllers implementing
+// PacketDiscardHandler (review F7, 2026-07-03).
+func TestSentPacketHandlerDropPacketsNotifiesDiscardHandler(t *testing.T) {
+	rttStats := utils.NewRTTStats()
+	cong := &hookTrackingCongestion{}
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		rttStats,
+		&utils.ConnectionStats{},
+		false,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		cong,
+		utils.DefaultLogger,
+	)
+
+	now := monotime.Now()
+	pn1 := sph.PopPacketNumber(protocol.EncryptionInitial)
+	sph.SentPacket(now, pn1, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 1000, false, false)
+	pn2 := sph.PopPacketNumber(protocol.EncryptionInitial)
+	sph.SentPacket(now.Add(time.Millisecond), pn2, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 1000, false, false)
+
+	sph.DropPackets(protocol.EncryptionInitial, now.Add(2*time.Millisecond))
+
+	require.Equal(t, []protocol.PacketNumber{pn1, pn2}, cong.discardedPackets,
+		"dropping the Initial space must forward outstanding PNs to the discard hook")
 }

@@ -73,6 +73,17 @@ type SpuriousLossHandler interface {
 	OnSpuriousLossDetected(packetNumber protocol.PacketNumber, packetReordering protocol.PacketNumber)
 }
 
+// PacketDiscardHandler is implemented by congestion controllers that track
+// per-packet state and need to forget packets whose packet number space was
+// dropped (Initial/Handshake completion, 0-RTT rejection). The packets were
+// neither acked nor lost; they must simply become invisible to the
+// controller's samplers. Without this signal, per-packet state keyed by raw
+// packet number leaks, and later 1-RTT packets reusing the same raw PN can
+// be misclassified as PN-space collisions (review F7, 2026-07-03).
+type PacketDiscardHandler interface {
+	OnPacketDiscarded(packetNumber protocol.PacketNumber)
+}
+
 // PTOHandler is implemented by congestion controllers that want an explicit
 // QUIC PTO signal with live inflight. now is the time the PTO timer fired;
 // controllers use it to validate that later-delivered data was sent after

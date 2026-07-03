@@ -3809,3 +3809,83 @@ func TestBBRv3RoundDiagnosticsResetWithoutQlogger(t *testing.T) {
 		"diagnostics must reset at the round boundary without a qlogger")
 	require.Equal(t, bbr.roundCount, bbr.lastDiagRoundReset)
 }
+
+// TestBBRv3OnPacketDiscardedForgetsPacketAndCollision is the regression test
+// for review finding F7 (2026-07-03): packets whose PN space is dropped must
+// leave the sampler's per-packet map, and their raw PNs must not poison
+// later 1-RTT packets via collision quarantine.
+func TestBBRv3OnPacketDiscardedForgetsPacketAndCollision(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	// An unresolved handshake-space packet is discarded when its space drops:
+	// a later 1-RTT packet reusing the raw PN must be tracked, not treated as
+	// a PN-space collision.
+	bbr.OnPacketSent(now, 1_000, 0, 1_000, true)
+	require.Contains(t, bbr.sentPackets, protocol.PacketNumber(0))
+	bbr.OnPacketDiscarded(0)
+	require.NotContains(t, bbr.sentPackets, protocol.PacketNumber(0))
+
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1_000, 0, 1_000, true)
+	require.Contains(t, bbr.sentPackets, protocol.PacketNumber(0),
+		"post-discard PN reuse must be tracked, not quarantined as a collision")
+	require.NotContains(t, bbr.collisionPNs, protocol.PacketNumber(0))
+
+	// A quarantined collision PN is rehabilitated once the colliding space's
+	// packet is discarded.
+	bbr.OnPacketSent(now, 2_000, 5, 1_000, true)
+	bbr.OnPacketSent(now, 3_000, 5, 1_000, true) // collision: both dropped, PN quarantined
+	require.Contains(t, bbr.collisionPNs, protocol.PacketNumber(5))
+	bbr.OnPacketDiscarded(5)
+	require.NotContains(t, bbr.collisionPNs, protocol.PacketNumber(5))
+
+	bbr.OnPacketSent(now.Add(time.Millisecond), 1_000, 5, 1_000, true)
+	require.Contains(t, bbr.sentPackets, protocol.PacketNumber(5),
+		"discard must lift the collision quarantine for the retired raw PN")
+}
+
+// TestBBRv3ECNTooHighUsesIntervalScopedCE is the regression test for review
+// finding F4 (2026-07-03): RS.delivered_ce must cover the newest acked
+// packet's full flight window (C.delivered_ce - P.delivered_ce, per
+// tcp_bbr.c tx.delivered_ce), not just the current ACK event. CE marks
+// concentrated in an earlier event within the flight window must count
+// toward the ECN too-high check for packets that were in flight then.
+func TestBBRv3ECNTooHighUsesIntervalScopedCE(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+	bbr.minRTT = 2 * time.Millisecond // within ECN_MAX_RTT: feedback accepted
+
+	// Two packets in flight before any CE. P2's flight window will span the
+	// CE-marked event.
+	bbr.OnPacketSent(now, 1_500, 1, 1_500, true)                          // P1
+	bbr.OnPacketSent(now.Add(100*time.Microsecond), 2_500, 2, 1_000, true) // P2, CE snapshot = 0
+
+	// Event 1 (still in Startup, so no upper-bound machinery runs): P1 is
+	// acked fully CE-marked.
+	t1 := now.Add(time.Millisecond)
+	bbr.OnECNFeedback(1_500, 0, 0, 1, 0, t1)
+	bbr.OnPacketAcked(1, 1_500, 2_500, t1)
+	bbr.OnAckEventEnd(t1)
+	require.Equal(t, uint64(1_500), bbr.totalBytesAckedCE)
+	require.True(t, bbr.ecnEligible)
+
+	// Now probing in ProbeBW_UP with probe samples active.
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp
+	bbr.fullBandwidthReached = true
+	bbr.bwProbeSamples = true
+	bbr.bwHi[0] = 1_000_000
+
+	// Event 2: P2 acked with NO new CE. Event-scoped CE would be 0 and could
+	// never trigger; interval-scoped CE is 1500 of 2500 delivered (60%),
+	// exceeding ECN_THRESH (50%) — the probe must stop and enter DOWN, then
+	// immediately transition to CRUISE since inflight=0 after the ACK
+	// (checkTimeToCruise fires).
+	t2 := now.Add(2 * time.Millisecond)
+	bbr.OnPacketAcked(2, 1_000, 1_000, t2)
+	bbr.OnAckEventEnd(t2)
+
+	require.Equal(t, probeBWCruise, bbr.probeBWPhase,
+		"CE marks within the newest packet's flight window must trigger the ECN too-high response (DOWN->CRUISE immediate transition at zero inflight)")
+	require.True(t, bbr.prevProbeTooHigh, "the probe must be recorded as too high")
+}

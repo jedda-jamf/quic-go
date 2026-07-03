@@ -348,6 +348,9 @@ type bbrSentPacketState struct {
 	txInFlight     protocol.ByteCount // P.tx_in_flight: C.inflight after this packet
 	isAppLimited   bool               // P.is_app_limited: app-limited bubble active at send
 	totalBytesLost uint64             // P.lost: C.lost at send time (§5.5.10 loss-round)
+	// P.delivered_ce: C.delivered_ce at send time (tcp_bbr.c tx.delivered_ce).
+	// Enables interval-scoped RS.delivered_ce (review F4, 2026-07-03).
+	totalBytesAckedCE uint64
 }
 
 // bbrRateSample holds per-ACK delivery rate sample output.
@@ -369,7 +372,7 @@ type bbrSentPacketState struct {
 type bbrRateSample struct {
 	newlyAcked     protocol.ByteCount // RS.newly_acked: volume acked in this event
 	delivered      protocol.ByteCount // RS.delivered: C.delivered - P.delivered
-	deliveredCE    protocol.ByteCount // CE-marked bytes (ECN, tcp_bbr.c extension)
+	deliveredCE    protocol.ByteCount // RS.delivered_ce: C.delivered_ce - P.delivered_ce (interval-scoped, tcp_bbr.c tx.delivered_ce)
 	deliveryRate   protocol.ByteCount // RS.delivery_rate: bytes/s
 	interval       time.Duration      // RS.interval: max(send_elapsed, ack_elapsed)
 	sendElapsed    time.Duration      // RS.send_elapsed: P.send_time - P.first_send_time
@@ -525,6 +528,7 @@ type BBRv3 struct {
 	pendingTxInFlight      protocol.ByteCount
 	pendingIsAppLimited    bool
 	pendingTotalLostAtSend uint64
+	pendingTotalCEAtSend   uint64 // P.delivered_ce of the newest acked packet (F4)
 	pendingCEBytes         protocol.ByteCount
 	pendingNewestSentTime  monotime.Time
 	pendingNewestPacketNum protocol.PacketNumber
@@ -614,6 +618,7 @@ var (
 	_ AppLimitedHandler           = &BBRv3{}
 	_ SpuriousLossHandler         = &BBRv3{}
 	_ PTOHandler                  = &BBRv3{}
+	_ PacketDiscardHandler        = &BBRv3{}
 	_ ConnectionMigrationHandler  = &BBRv3{}
 )
 
@@ -784,14 +789,15 @@ func (bbr *BBRv3) OnPacketSent(
 	// The bubble is set by MarkAppLimited() when send was allowed but no data available.
 	isAppLimited := bbr.appLimitedUntil != 0
 	bbr.sentPackets[packetNumber] = bbrSentPacketState{
-		bytes:          bytes,
-		delivered:      bbr.totalBytesAcked,
-		deliveredTime:  bbr.deliveredTime,
-		firstSentTime:  bbr.firstSentTime,
-		sentTime:       sentTime,
-		txInFlight:     bytesInFlight,
-		isAppLimited:   isAppLimited,
-		totalBytesLost: bbr.totalBytesLost,
+		bytes:             bytes,
+		delivered:         bbr.totalBytesAcked,
+		deliveredTime:     bbr.deliveredTime,
+		firstSentTime:     bbr.firstSentTime,
+		sentTime:          sentTime,
+		txInFlight:        bytesInFlight,
+		isAppLimited:      isAppLimited,
+		totalBytesLost:    bbr.totalBytesLost,
+		totalBytesAckedCE: bbr.totalBytesAckedCE,
 	}
 	bbr.totalBytesSent += uint64(bytes)
 }
@@ -857,6 +863,7 @@ func (bbr *BBRv3) OnPacketAcked(
 		bbr.pendingTxInFlight = st.txInFlight
 		bbr.pendingIsAppLimited = st.isAppLimited
 		bbr.pendingTotalLostAtSend = st.totalBytesLost
+		bbr.pendingTotalCEAtSend = st.totalBytesAckedCE
 		bbr.pendingNewestSentTime = st.sentTime
 		bbr.pendingNewestPacketNum = ackedPacketNumber
 		bbr.pendingCEBytes = bbr.consumePendingECNBytes(eventTime)
@@ -872,6 +879,7 @@ func (bbr *BBRv3) OnPacketAcked(
 			bbr.pendingTxInFlight = st.txInFlight
 			bbr.pendingIsAppLimited = st.isAppLimited
 			bbr.pendingTotalLostAtSend = st.totalBytesLost
+			bbr.pendingTotalCEAtSend = st.totalBytesAckedCE
 			bbr.pendingNewestSentTime = st.sentTime
 			bbr.pendingNewestPacketNum = ackedPacketNumber
 		}
@@ -947,6 +955,19 @@ func (bbr *BBRv3) OnRetransmissionTimeout(_ bool) {
 	// violated §5.6.4.4's requirement that cwnd = inflight + 1 SMSS.
 	// Rather than pass incorrect state, we do nothing — the correct path
 	// is OnPTO, which receives bytesInFlight from the ackhandler.
+}
+
+// OnPacketDiscarded is called when a packet's number space is dropped
+// (Initial/Handshake completion, 0-RTT rejection). The packet was neither
+// acked nor lost, so it must simply become invisible to the sampler.
+// The collision quarantine for the raw PN is also lifted: the PN space is
+// retired, so future reuse of that raw PN by 1-RTT packets is legitimate
+// and must be tracked normally (review F7, 2026-07-03). Without this,
+// unresolved handshake packets leaked in sentPackets and converted early
+// 1-RTT PNs into permanent sampler blind spots via collision quarantine.
+func (bbr *BBRv3) OnPacketDiscarded(packetNumber protocol.PacketNumber) {
+	delete(bbr.sentPackets, packetNumber)
+	delete(bbr.collisionPNs, packetNumber)
 }
 
 func (bbr *BBRv3) OnPTO(now monotime.Time, bytesInFlight protocol.ByteCount) {
@@ -1151,10 +1172,20 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 
 	bytesInFlight := bbr.bytesInFlightForAckEvent()
 
+	// Accumulate this event's CE bytes into the running total FIRST, then
+	// derive the interval-scoped RS.delivered_ce as
+	// C.delivered_ce - P.delivered_ce (per tcp_bbr.c tx.delivered_ce), so it
+	// covers the newest packet's full flight window like RS.delivered and
+	// RS.lost do. Previously rs.deliveredCE was event-scoped while
+	// rs.delivered was interval-scoped, diluting the CE ratio in
+	// isInflightTooHigh by roughly interval/event and making the 50% ECN
+	// too-high threshold effectively unreachable (review F4, 2026-07-03).
+	bbr.totalBytesAckedCE += uint64(bbr.pendingCEBytes)
+
 	rs := bbrRateSample{
 		newlyAcked:     bbr.pendingAckedBytes,
 		delivered:      protocol.ByteCount(bbr.totalBytesAcked - bbr.pendingPriorDelivered),
-		deliveredCE:    bbr.pendingCEBytes,
+		deliveredCE:    protocol.ByteCount(bbr.totalBytesAckedCE - bbr.pendingTotalCEAtSend),
 		sendElapsed:    bbr.pendingSendElapsed,
 		ackElapsed:     now.Sub(bbr.pendingPriorTime),
 		txInFlight:     bbr.pendingTxInFlight,
@@ -1176,7 +1207,6 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 		rs.deliveryRate = 0
 		sampleWasSuppressed = true
 	}
-	bbr.totalBytesAckedCE += uint64(rs.deliveredCE)
 
 	// Update round-level diagnostic accumulators for qlog telemetry.
 	bbr.totalAckEventsInRound++
@@ -1270,6 +1300,7 @@ func (bbr *BBRv3) clearPendingAckEvent() {
 	bbr.pendingTxInFlight = 0
 	bbr.pendingIsAppLimited = false
 	bbr.pendingTotalLostAtSend = 0
+	bbr.pendingTotalCEAtSend = 0
 	bbr.pendingCEBytes = 0
 	bbr.pendingNewestSentTime = 0
 	bbr.pendingNewestPacketNum = 0
