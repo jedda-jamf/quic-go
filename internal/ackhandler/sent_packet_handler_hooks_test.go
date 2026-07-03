@@ -58,7 +58,7 @@ func (h *hookTrackingCongestion) OnAckEventStart(eventTime monotime.Time, bytesI
 func (h *hookTrackingCongestion) OnAckEventEnd(eventTime monotime.Time) {
 	h.ackEndTimes = append(h.ackEndTimes, eventTime)
 }
-func (h *hookTrackingCongestion) OnLossDetectionStart() { h.lossDetectionStarts++ }
+func (h *hookTrackingCongestion) OnLossDetectionStart(monotime.Time) { h.lossDetectionStarts++ }
 func (h *hookTrackingCongestion) OnECNFeedback(
 	ackedBytes protocol.ByteCount,
 	ect0Total, ect1Total, ceTotal int64,

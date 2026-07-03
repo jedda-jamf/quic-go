@@ -535,7 +535,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
 
 	if lossStart, ok := h.congestion.(congestion.LossDetectionHandler); ok {
-		lossStart.OnLossDetectionStart()
+		lossStart.OnLossDetectionStart(rcvTime)
 	}
 	h.detectLostPackets(rcvTime, encLevel)
 	if encLevel == protocol.Encryption1RTT {
@@ -1031,7 +1031,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		}
 		// Early retransmit or time loss detection
 		if lossStart, ok := h.congestion.(congestion.LossDetectionHandler); ok {
-			lossStart.OnLossDetectionStart()
+			lossStart.OnLossDetectionStart(now)
 		}
 		h.detectLostPackets(now, encLevel)
 		return nil

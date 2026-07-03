@@ -539,6 +539,14 @@ type BBRv3 struct {
 	ackEventBytesInFlight protocol.ByteCount
 	ackEventTime          monotime.Time
 
+	// lossPassTime is the event time of the current loss-detection pass, set
+	// by OnLossDetectionStart. Phase transitions triggered from the
+	// per-lost-packet path (OnCongestionEvent -> handleInflightTooHigh) occur
+	// before OnAckEventStart runs — and with no ACK event at all on
+	// timer-driven passes — so this is the only valid clock at that point
+	// (review F9, 2026-07-03).
+	lossPassTime monotime.Time
+
 	rng *rand.Rand
 
 	qlogger        qlogwriter.Recorder
@@ -1029,8 +1037,11 @@ func (bbr *BBRv3) OnAckEventEnd(eventTime monotime.Time) {
 // (both ACK-driven and timer-driven). This resets per-pass loss event counting
 // so that multiple lost packets in the same pass count as one loss event.
 // Per RFC §5.3.1.3, Startup loss exit uses event count, not packet count.
-func (bbr *BBRv3) OnLossDetectionStart() {
+// It also records the pass's event time, giving loss-triggered phase
+// transitions a valid clock (review F9, 2026-07-03).
+func (bbr *BBRv3) OnLossDetectionStart(now monotime.Time) {
 	bbr.lossEventCountedThisACK = false
+	bbr.lossPassTime = now
 }
 
 // OnAckEventStart is called by ackhandler after loss detection but before ACK callbacks.
@@ -1209,6 +1220,10 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 
 func (bbr *BBRv3) clearPendingAckEvent() {
 	bbr.pendingAckEventValid = false
+	// Reset the timestamp too: it is used as a last-resort clock fallback in
+	// handleInflightTooHigh, and a stale previous-event value there is worse
+	// than an explicit zero (review F9, 2026-07-03).
+	bbr.pendingAckEventTime = 0
 	bbr.pendingAckedBytes = 0
 	bbr.pendingPriorInFlight = 0
 	bbr.pendingPriorDelivered = 0
@@ -1404,6 +1419,20 @@ func (bbr *BBRv3) updateCongestionSignals(rs bbrRateSample) {
 	}
 	bbr.cutSnapshotRound = bbr.roundCount
 
+	// End the spurious-recovery episode once a full loss round completes with
+	// no new losses and no unpromoted pending losses. Without a teardown, the
+	// episode accumulates every genuinely lost packet for the connection
+	// lifetime: unbounded map growth, and the >50%-spurious restore threshold
+	// becomes permanently unreachable (review F2, 2026-07-03). This is the
+	// QUIC analog of the RFC §5.5.11 recovery episode ending on recovery
+	// exit. Spurious-loss signals arriving within the reordering window are
+	// still honored: they surface at most ~1 round after the loss round in
+	// which the packet was declared lost, and this teardown requires one
+	// additional quiet loss round beyond that.
+	if bbr.lossEpisodeActive && !bbr.lossInRound && len(bbr.pendingLossPackets) == 0 {
+		bbr.endLossEpisode()
+	}
+
 	bbr.lossInRound = false
 	bbr.ecnInRound = false
 }
@@ -1426,6 +1455,12 @@ func (bbr *BBRv3) updateCongestionSignals(rs bbrRateSample) {
 // to allow aggressive probing per isProbingBandwidth().
 func (bbr *BBRv3) adaptLowerBounds(bbrRateSample) {
 	if bbr.isProbingBandwidth() {
+		// Losses during probing feed handleInflightTooHigh (upper-bound
+		// adaptation), not short-term cuts, so they never become part of a
+		// spurious-recovery episode. Drop any pending per-packet loss records
+		// here; otherwise they linger and get merged into an unrelated,
+		// much later episode with stale undo state (review F2, 2026-07-03).
+		bbr.pendingLossPackets = nil
 		return
 	}
 	// Lower-bound adaptation:
@@ -1608,14 +1643,18 @@ func (bbr *BBRv3) handleQueueTooHighInStartup() {
 // and ~40% throughput loss. By checking growth on every ACK, ANY high-rate
 // sample in the round can reset the baseline, preventing this failure mode.
 //
-// State-gate: this estimator only applies to Startup. ProbeRTT can be entered
-// before fullBandwidthReached (via probe_rtt_interval expiry), and the reduced
-// cwnd would cause spurious bandwidth plateaus. ProbeBW_UP has its own plateau
-// detection in updateCyclePhase().
+// No state gate: per RFC §5.3.1.2 this estimator serves BOTH accelerating
+// phases — Startup and ProbeBW_UP ("In phases where BBR is accelerating to
+// probe the available bandwidth - Startup and ProbeBW_UP - BBR runs a state
+// machine to estimate whether an accelerating sending rate has saturated the
+// available per-flow bandwidth"). ProbeBW_UP's plateau exit in
+// updateCyclePhase() consumes fullBandwidthNow, so gating this function to
+// Startup would make that exit unreachable (review F1, 2026-07-03).
+// ProbeRTT is protected without a state gate: updateMinRTT() marks every ACK
+// during ProbeRTT app-limited, and app-limited samples return below. This
+// matches tcp_bbr.c, where bbr_check_full_bw_reached() is invoked
+// unconditionally from bbr_update_model() for all modes.
 func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
-	if bbr.state != BBRStartup {
-		return
-	}
 	if bbr.fullBandwidthNow || rs.isAppLimited {
 		return
 	}
@@ -1786,9 +1825,19 @@ func (bbr *BBRv3) handleInflightTooHigh(rs bbrRateSample) {
 		bbr.inflightHi = max(rs.txInFlight, target)
 	}
 	if bbr.state == BBRProbeBW && bbr.probeBWPhase == probeBWUp {
-		// Use the ACK event time from OnAckEventStart when available.
-		// This provides correct timing when loss triggers phase transition.
+		// Clock preference for the DOWN transition (review F9, 2026-07-03):
+		//  1. ackEventTime — set by OnAckEventStart; valid on the ACK-event
+		//     processing path (adaptUpperBounds).
+		//  2. lossPassTime — set by OnLossDetectionStart; valid on the
+		//     per-lost-packet path (OnCongestionEvent), which runs before
+		//     OnAckEventStart, and on timer-driven passes with no ACK event.
+		//  3. pendingAckEventTime — last-resort fallback (previous event).
+		// A zero cycleStamp would disable the wall-clock probe trigger in
+		// checkTimeToProbeBW until some later transition reset it.
 		eventTime := bbr.ackEventTime
+		if eventTime.IsZero() {
+			eventTime = bbr.lossPassTime
+		}
 		if eventTime.IsZero() {
 			eventTime = bbr.pendingAckEventTime
 		}
@@ -2134,10 +2183,7 @@ func (bbr *BBRv3) restoreBoundsForSpuriousEpisode() {
 	}
 
 	// Clear episode state after restoration
-	bbr.lossEpisodeActive = false
-	bbr.lossEpisodePackets = nil
-	bbr.lossEpisodeTotalBytes = 0
-	bbr.lossEpisodeSpuriousBytes = 0
+	bbr.endLossEpisode()
 
 	// Emit qlog event for debugging/analysis
 	if bbr.qlogger != nil {
@@ -2159,6 +2205,17 @@ func (bbr *BBRv3) restoreBoundsForSpuriousEpisode() {
 			RestoredCwnd:       uint64(bbr.congestionWindow),
 		})
 	}
+}
+
+// endLossEpisode discards all state for the active spurious-recovery episode.
+// Called when the episode's majority threshold triggered a restore, or when a
+// full loss round passes with no new losses (the episode is over and any
+// still-unresolved packets were genuinely lost).
+func (bbr *BBRv3) endLossEpisode() {
+	bbr.lossEpisodeActive = false
+	bbr.lossEpisodePackets = nil
+	bbr.lossEpisodeTotalBytes = 0
+	bbr.lossEpisodeSpuriousBytes = 0
 }
 
 // isInflightTooHigh checks for congestion signal threshold violations.

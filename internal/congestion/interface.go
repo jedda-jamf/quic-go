@@ -41,9 +41,13 @@ type AckEventHandler interface {
 }
 
 // LossDetectionHandler is implemented by congestion controllers that need a
-// callback before each loss-detection pass.
+// callback before each loss-detection pass (both ACK-driven and timer-driven).
+// now is the event time of the pass: the ACK receive time for ACK-driven
+// passes, or the timer fire time for timer-driven passes. It gives the
+// controller a valid clock for any state transition triggered from within the
+// per-lost-packet path, where no ACK-event timestamp is available yet.
 type LossDetectionHandler interface {
-	OnLossDetectionStart()
+	OnLossDetectionStart(now monotime.Time)
 }
 
 // ECNFeedbackHandler is implemented by congestion controllers that consume

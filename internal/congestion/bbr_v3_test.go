@@ -1939,45 +1939,89 @@ func TestBBRv3StartupEstimatorsStateGated(t *testing.T) {
 			"inflightHi MUST NOT be capped by ProbeRTT loss")
 	})
 
-	t.Run("checkFullBwReached_not_in_ProbeRTT", func(t *testing.T) {
+	t.Run("checkFullBwReached_app_limited_in_ProbeRTT", func(t *testing.T) {
+		// ProbeRTT protection comes from app-limited marking, not a state
+		// gate: updateMinRTT() calls MarkAppLimited on every ACK during
+		// ProbeRTT, so its rate samples arrive with isAppLimited=true and the
+		// estimator must ignore them. (A state gate here previously made
+		// ProbeBW_UP's plateau exit unreachable — review F1, 2026-07-03.)
 		bbr := newTestBBRv3()
-		// Set up conditions that WOULD trigger bandwidth plateau in Startup
-		bbr.state = BBRProbeRTT // But we're in ProbeRTT, not Startup
+		bbr.state = BBRProbeRTT
 		bbr.fullBandwidth = 1_000
 		bbr.bwHi[0] = 1_000
 		bbr.minRTT = 10 * time.Millisecond
 
-		// Simulate FULL_BW_ROUNDS of plateau samples
-		rs := bbrRateSample{deliveryRate: 1_100}
+		// Simulate FULL_BW_ROUNDS of plateau samples, app-limited as they
+		// would be in a real ProbeRTT.
+		rs := bbrRateSample{deliveryRate: 1_100, isAppLimited: true}
 		for range FULL_BW_ROUNDS {
 			bbr.roundStart = true
 			bbr.checkFullBwReached(rs)
 		}
 
 		require.False(t, bbr.fullBandwidthReached,
-			"bandwidth plateau MUST NOT trigger in ProbeRTT state")
+			"app-limited ProbeRTT samples MUST NOT trigger bandwidth plateau")
 		require.Equal(t, 0, bbr.fullBandwidthCount,
-			"fullBandwidthCount MUST NOT accumulate in ProbeRTT state")
+			"fullBandwidthCount MUST NOT accumulate from app-limited samples")
 	})
 
-	t.Run("checkFullBwReached_not_in_ProbeBW", func(t *testing.T) {
+	t.Run("checkFullBwReached_runs_in_ProbeBW_UP", func(t *testing.T) {
+		// Per RFC §5.3.1.2 the full-pipe estimator serves both Startup and
+		// ProbeBW_UP; updateCyclePhase's UP exit consumes fullBandwidthNow.
 		bbr := newTestBBRv3()
-		// ProbeBW_UP has its own plateau detection in updateCyclePhase
 		bbr.state = BBRProbeBW
 		bbr.probeBWPhase = probeBWUp
+		bbr.fullBandwidthReached = true
 		bbr.fullBandwidth = 1_000
 		bbr.bwHi[0] = 1_000
 		bbr.minRTT = 10 * time.Millisecond
 
-		rs := bbrRateSample{deliveryRate: 1_100}
+		rs := bbrRateSample{deliveryRate: 1_100} // < 1_000 * 1.25, no growth
 		for range FULL_BW_ROUNDS {
 			bbr.roundStart = true
 			bbr.checkFullBwReached(rs)
 		}
 
-		require.False(t, bbr.fullBandwidthNow,
-			"Startup's checkFullBwReached MUST NOT run in ProbeBW state")
+		require.True(t, bbr.fullBandwidthNow,
+			"plateau MUST set fullBandwidthNow in ProbeBW_UP so the UP exit can fire")
 	})
+}
+
+// TestBBRv3ProbeBWUpExitsOnBandwidthPlateau is the end-to-end regression test
+// for review finding F1 (2026-07-03): on a lossless path, ProbeBW_UP must exit
+// to ProbeBW_DOWN via the §5.3.1.2 bandwidth-plateau estimator
+// (fullBandwidthNow), not only via loss/ECN or the ProbeRTT timer.
+func TestBBRv3ProbeBWUpExitsOnBandwidthPlateau(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRProbeBW
+	bbr.fullBandwidthReached = true
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000
+
+	now := monotime.Now()
+	bbr.startProbeBWUp(now, 1_000_000) // resets estimator, seeds full_bw baseline
+
+	// Flat delivery-rate samples (no 25% growth) across round starts, with no
+	// loss and without becoming cwnd-limited.
+	rs := bbrRateSample{
+		deliveryRate:  1_000_000,
+		newlyAcked:    1_200,
+		delivered:     1_200,
+		bytesInFlight: 10_000,
+		priorInFlight: 10_000,
+	}
+	for i := 0; i < FULL_BW_ROUNDS+1; i++ {
+		bbr.roundStart = true
+		bbr.checkFullBwReached(rs)
+		bbr.updateCyclePhase(rs, now.Add(time.Duration(i+1)*10*time.Millisecond))
+		if bbr.probeBWPhase == probeBWDown {
+			break
+		}
+	}
+
+	require.Equal(t, probeBWDown, bbr.probeBWPhase,
+		"ProbeBW_UP must exit to DOWN on bandwidth plateau without loss")
+	require.False(t, bbr.prevProbeTooHigh, "plateau exit is not a too-high exit")
 }
 
 // TestBBRv3GuardrailAckAdvancesFirstSendTime verifies RFC §4.1.2.3:
@@ -3495,4 +3539,122 @@ func TestBBRv3SustainedLossStability(t *testing.T) {
 	// Current behavior: unknown pending closed-loop harness implementation.
 	// This test documents the requirement and will be enabled when the harness exists.
 	t.Skip("Requires closed-loop path model harness (not yet implemented)")
+}
+
+// TestBBRv3LossEpisodeEndsAfterQuietRound is the regression test for review
+// finding F2 (2026-07-03): a spurious-recovery episode must terminate once a
+// full loss round passes with no new losses. Without teardown, episode state
+// grows unboundedly and the >50%-spurious restore threshold becomes
+// permanently unreachable after modest real loss.
+func TestBBRv3LossEpisodeEndsAfterQuietRound(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise // not probing: lower-bound cuts apply
+	bbr.fullBandwidthReached = true
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000
+
+	// Round 1: a real loss is recorded and promoted into an episode at the
+	// loss-round boundary.
+	bbr.OnCongestionEvent(42, 1_200, 0)
+	require.True(t, bbr.lossInRound)
+	bbr.lossRoundStart = true
+	bbr.updateCongestionSignals(bbrRateSample{})
+	require.True(t, bbr.lossEpisodeActive, "loss round must promote an episode")
+	require.False(t, bbr.lossInRound, "lossInRound resets at the round boundary")
+
+	// Round 2: quiet (no losses). The episode must end at the next
+	// loss-round boundary.
+	bbr.lossRoundStart = true
+	bbr.updateCongestionSignals(bbrRateSample{})
+	require.False(t, bbr.lossEpisodeActive, "quiet loss round must end the episode")
+	require.Nil(t, bbr.lossEpisodePackets)
+	require.Zero(t, bbr.lossEpisodeTotalBytes)
+	require.Zero(t, bbr.lossEpisodeSpuriousBytes)
+
+	// A late spurious signal for the ended episode is a no-op, not a restore.
+	bbr.OnSpuriousLossDetected(42, 0)
+	require.False(t, bbr.lossEpisodeActive)
+}
+
+// TestBBRv3LossEpisodeSurvivesActiveLossRounds verifies the teardown does not
+// fire while losses are ongoing: consecutive loss rounds keep one episode
+// alive and merge new losses into it.
+func TestBBRv3LossEpisodeSurvivesActiveLossRounds(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWCruise
+	bbr.fullBandwidthReached = true
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000
+
+	bbr.OnCongestionEvent(1, 1_200, 0)
+	bbr.lossRoundStart = true
+	bbr.updateCongestionSignals(bbrRateSample{})
+	require.True(t, bbr.lossEpisodeActive)
+
+	// New loss in the next round merges into the same episode.
+	bbr.OnLossDetectionStart(monotime.Now())
+	bbr.OnCongestionEvent(2, 1_200, 0)
+	bbr.lossRoundStart = true
+	bbr.updateCongestionSignals(bbrRateSample{})
+	require.True(t, bbr.lossEpisodeActive, "episode persists across active loss rounds")
+	require.Equal(t, protocol.ByteCount(2_400), bbr.lossEpisodeTotalBytes)
+	require.Len(t, bbr.lossEpisodePackets, 2)
+}
+
+// TestBBRv3PendingLossesDroppedWhileProbing verifies that losses recorded
+// while probing bandwidth (Startup, REFILL, UP) do not linger in
+// pendingLossPackets to seed a stale episode later (review F2, 2026-07-03).
+func TestBBRv3PendingLossesDroppedWhileProbing(t *testing.T) {
+	bbr := newTestBBRv3()
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp // probing: adaptLowerBounds must not promote
+	bbr.fullBandwidthReached = true
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000
+
+	bbr.OnCongestionEvent(7, 1_200, 0)
+	require.NotEmpty(t, bbr.pendingLossPackets)
+
+	bbr.adaptLowerBounds(bbrRateSample{})
+
+	require.Empty(t, bbr.pendingLossPackets,
+		"probing-phase losses must not linger as pending episode candidates")
+	require.False(t, bbr.lossEpisodeActive)
+}
+
+// TestBBRv3LossPathPhaseTransitionUsesLossPassClock is the regression test for
+// review finding F9 (2026-07-03): when excess loss aborts ProbeBW_UP via the
+// per-lost-packet path (OnCongestionEvent -> handleInflightTooHigh), the DOWN
+// transition runs before OnAckEventStart has fired for this event — and with
+// no ACK event at all on timer-driven passes. The transition must be stamped
+// with the loss-detection pass time from OnLossDetectionStart, not a zero or
+// stale clock; a zero cycleStamp disables checkTimeToProbeBW's wall-clock
+// probe trigger entirely.
+func TestBBRv3LossPathPhaseTransitionUsesLossPassClock(t *testing.T) {
+	bbr := newTestBBRv3()
+	now := monotime.Now()
+
+	bbr.state = BBRProbeBW
+	bbr.probeBWPhase = probeBWUp
+	bbr.fullBandwidthReached = true
+	bbr.minRTT = 10 * time.Millisecond
+	bbr.bwHi[0] = 1_000_000
+	bbr.bwProbeSamples = true // losses in UP reflect our probing
+
+	// One in-flight packet; losing it exceeds the 2% loss threshold
+	// (10_000 lost of 50_000 tx_in_flight = 20%).
+	bbr.OnPacketSent(now, 50_000, 1, 10_000, true)
+
+	lossPassTime := now.Add(5 * time.Millisecond)
+	bbr.OnLossDetectionStart(lossPassTime)
+	bbr.OnCongestionEvent(1, 10_000, 0)
+
+	require.Equal(t, probeBWDown, bbr.probeBWPhase,
+		"excess loss in UP must abort the probe and enter DOWN")
+	require.Equal(t, lossPassTime, bbr.cycleStamp,
+		"DOWN entry must be stamped with the loss-pass time, not zero/stale")
+	require.False(t, bbr.cycleStamp.IsZero(),
+		"a zero cycleStamp would disable the wall-clock probe trigger")
 }
