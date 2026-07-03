@@ -583,13 +583,16 @@ type BBRv3 struct {
 	lossEpisodeSpuriousBytes protocol.ByteCount
 	pendingLossPackets       map[protocol.PacketNumber]protocol.ByteCount
 
-	// Round-level diagnostic accumulators for qlog telemetry.
-	// These track per-round statistics to diagnose filled-pipe estimator issues
-	// without requiring per-ACK event emission. Reset on each round boundary.
+	// Round-level diagnostic accumulators. Originally qlog telemetry, now
+	// also control-plane state: checkFullBwReached's zero-valid-sample guard
+	// (review F6, 2026-07-03) consumes validSamplesInRound. Reset at true
+	// round boundaries at end-of-event in processPendingAckEvent —
+	// unconditionally, NOT gated on a qlog recorder being attached.
 	validSamplesInRound      uint32             // ACKs with deliveryRate > 0
 	suppressedSamplesInRound uint32             // ACKs where interval < min_rtt caused suppression
 	maxDeliveryRateInRound   protocol.ByteCount // Highest valid deliveryRate this round
 	totalAckEventsInRound    uint32             // Total ACK events processed this round
+	lastDiagRoundReset       uint64             // roundCount at last accumulator reset
 
 	// F1 instrumentation: loss-cut trajectory tracking
 	suppressedLossRoundStarts uint32             // Suppressed samples at loss_round_start
@@ -1239,6 +1242,17 @@ func (bbr *BBRv3) processPendingAckEvent(now monotime.Time) {
 	}
 	bbr.maybeQlogStateChange()
 	bbr.maybeQlogRoundUpdate(rs)
+	// Reset the per-round diagnostic accumulators at true round boundaries.
+	// This must happen here — after checkFullBwReached consumed the counts
+	// for the round that just ended, and after qlog emission — and must NOT
+	// be gated on a qlog recorder: checkFullBwReached's zero-valid-sample
+	// guard reads validSamplesInRound on every connection (review F6,
+	// 2026-07-03). The roundCount guard makes mid-event startRoundNow()
+	// calls (which force roundStart without advancing roundCount) a no-op.
+	if bbr.roundStart && bbr.roundCount != bbr.lastDiagRoundReset {
+		bbr.lastDiagRoundReset = bbr.roundCount
+		bbr.resetRoundDiagnostics()
+	}
 	bbr.clearPendingAckEvent()
 }
 
@@ -1695,6 +1709,20 @@ func (bbr *BBRv3) checkFullBwReached(rs bbrRateSample) {
 	if !bbr.roundStart {
 		return
 	}
+	// Don't count a "no growth" round when the round produced no valid rate
+	// samples at all — with every sample suppressed (interval < min_rtt),
+	// there was no observation to plateau against. tcp_bbr.c reaches the
+	// same outcome differently: with full_bw == 0, an invalid (zero) sample
+	// satisfies `0 >= 0 * thresh` and keeps resetting the baseline, so
+	// full_bw_cnt never advances on all-invalid rounds. A round counts if it
+	// had any valid mid-round sample (validSamplesInRound, populated before
+	// this runs and reset at end-of-event) or if the round-boundary sample
+	// itself is valid. Rounds where only the boundary sample was suppressed
+	// still count (commit ee938fce); all-suppressed rounds do not
+	// (review F6, 2026-07-03).
+	if bbr.validSamplesInRound == 0 && rs.deliveryRate == 0 {
+		return
+	}
 	bbr.fullBandwidthCount++
 	bbr.fullBandwidthNow = bbr.fullBandwidthCount >= FULL_BW_ROUNDS
 	if bbr.fullBandwidthNow {
@@ -1949,22 +1977,6 @@ func (bbr *BBRv3) startProbeBWCruise(now monotime.Time) {
 	bbr.phaseStartStamp = now
 }
 
-// startProbeBWCruiseAfterProbeRTT re-enters ProbeBW from ProbeRTT without
-// arming ACKS_PROBE_STOPPING. ProbeRTT is not the end of a bandwidth-probe
-// cycle, so the first low post-ProbeRTT samples must not rotate the max_bw
-// filter and discard the previous cycle's high samples.
-func (bbr *BBRv3) startProbeBWCruiseAfterProbeRTT(now monotime.Time) {
-	bbr.resetCongestionSignals()
-	bbr.bwProbeUpCnt = protocol.MaxByteCount
-	bbr.pickProbeWait()
-	bbr.cycleStamp = now
-	bbr.phaseStartStamp = now
-	bbr.ackPhase = ackPhaseInit
-	bbr.nextRoundDelivered = bbr.totalBytesAcked
-	bbr.roundStart = false
-	bbr.startProbeBWCruise(now)
-}
-
 func (bbr *BBRv3) startProbeBWRefill(now monotime.Time, probeUpRounds uint8) {
 	bbr.resetLowerBounds()
 	bbr.bwProbeUpRounds = probeUpRounds
@@ -2097,11 +2109,25 @@ func (bbr *BBRv3) checkProbeRTTDone(now monotime.Time) {
 	bbr.exitProbeRTT(now)
 }
 
+// exitProbeRTT mirrors tcp_bbr.c bbr_exit_probe_rtt(): enter ProbeBW via
+// startProbeBWDown (which resets the probe clock, picks a randomized probe
+// wait, and arms ackPhaseProbeStopping) and then immediately switch to
+// CRUISE, since inflight is known to be below the estimated BDP on ProbeRTT
+// exit. Arming ackPhaseProbeStopping means the max_bw filter advances at the
+// next round start — deliberately, per the reference: that round's sample is
+// the best recent chance at the flow's highest available bw, so it is the
+// right moment to age out the older filter slot. Low post-ProbeRTT samples
+// cannot cause a harmful advance because ProbeRTT marks every ACK
+// app-limited (see updateMinRTT) and adaptUpperBounds skips the advance for
+// app-limited samples (review F5, 2026-07-03; previously this path used a
+// custom helper that skipped the arm entirely, aging the filter one full
+// probe cycle late after every ProbeRTT).
 func (bbr *BBRv3) exitProbeRTT(now monotime.Time) {
 	bbr.resetLowerBounds()
 	if bbr.fullBandwidthReached {
 		bbr.state = BBRProbeBW
-		bbr.startProbeBWCruiseAfterProbeRTT(now)
+		bbr.startProbeBWDown(now)
+		bbr.startProbeBWCruise(now)
 		return
 	}
 	bbr.state = BBRStartup
@@ -2665,9 +2691,10 @@ func (bbr *BBRv3) maybeQlogRoundUpdate(rs bbrRateSample) {
 		bbr.qlogger.RecordEvent(bbr.qlogModelUpdate("startup_round"))
 		bbr.qlogger.RecordEvent(bbr.qlogControlUpdate("startup_round"))
 	}
-	// Reset round-level diagnostic accumulators after emitting qlog.
-	// The next round will start fresh accumulation.
-	bbr.resetRoundDiagnostics()
+	// Note: resetRoundDiagnostics is NOT called here. The accumulators are
+	// control-plane state (checkFullBwReached reads them) and are reset
+	// unconditionally at end-of-event in processPendingAckEvent, whether or
+	// not a qlog recorder is attached (review F6, 2026-07-03).
 }
 
 func (bbr *BBRv3) resetRoundDiagnostics() {

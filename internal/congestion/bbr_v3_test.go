@@ -1913,8 +1913,14 @@ func TestBBRv3StartupExitsWithSuppressedRoundStartSamples(t *testing.T) {
 	bbr.fullBandwidth = 100_000_000 // Baseline from first valid sample
 
 	// Simulate 3 rounds where round-start samples are suppressed (rate=0)
-	// but no growth is occurring. Counter should still advance at each round.
+	// but the rounds contained valid mid-round samples showing no growth.
+	// The counter should still advance at each round. (Per review F6,
+	// 2026-07-03, rounds with NO valid samples at all do not count — see
+	// TestBBRv3StartupNoGrowthCountRequiresValidSamples — so this test
+	// models the valid mid-round observations its scenario describes via
+	// the validSamplesInRound accumulator.)
 	for round := 0; round < FULL_BW_ROUNDS; round++ {
+		bbr.validSamplesInRound = 1 // valid mid-round samples, below 1.25x growth
 		bbr.roundStart = true
 		// Suppressed round-start sample: rate=0 because interval < min_rtt
 		rs := bbrRateSample{
@@ -3249,27 +3255,64 @@ func TestBBRv3GuardrailProbeRTTExitsToProbeBW(t *testing.T) {
 		"fullBandwidthReached should remain true after ProbeRTT")
 }
 
-func TestBBRv3GuardrailProbeRTTExitDoesNotRotateMaxBwFilter(t *testing.T) {
-	bbr := newTestBBRv3()
-	now := monotime.Now()
+// TestBBRv3GuardrailProbeRTTExitMatchesReference verifies the tcp_bbr.c
+// bbr_exit_probe_rtt() sequence (review F5, 2026-07-03): exit lands in
+// CRUISE with ackPhaseProbeStopping armed and a fresh probe clock. The
+// max_bw filter is protected from low post-ProbeRTT samples by the
+// app-limited gate in adaptUpperBounds — ProbeRTT marks every ACK
+// app-limited — not by skipping the ackPhase arm. Non-app-limited samples
+// DO advance the filter at the next round start, per the reference: that is
+// the right moment to age out the older slot.
+func TestBBRv3GuardrailProbeRTTExitMatchesReference(t *testing.T) {
+	t.Run("app_limited_sample_does_not_advance_filter", func(t *testing.T) {
+		bbr := newTestBBRv3()
+		now := monotime.Now()
 
-	bbr.state = BBRProbeRTT
-	bbr.fullBandwidthReached = true
-	bbr.bwHi[0] = 10_000_000
-	bbr.bwHi[1] = 50_000
+		bbr.state = BBRProbeRTT
+		bbr.fullBandwidthReached = true
+		bbr.bwHi[0] = 10_000_000
+		bbr.bwHi[1] = 50_000
 
-	bbr.exitProbeRTT(now)
+		bbr.exitProbeRTT(now)
 
-	require.Equal(t, BBRProbeBW, bbr.state)
-	require.Equal(t, probeBWCruise, bbr.probeBWPhase)
-	require.Equal(t, ackPhaseInit, bbr.ackPhase)
-	require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth())
+		require.Equal(t, BBRProbeBW, bbr.state)
+		require.Equal(t, probeBWCruise, bbr.probeBWPhase)
+		require.Equal(t, ackPhaseProbeStopping, bbr.ackPhase,
+			"exit must arm ackPhaseProbeStopping, per bbr_exit_probe_rtt")
+		require.False(t, bbr.cycleStamp.IsZero(), "probe clock must be reset on exit")
+		require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth())
 
-	bbr.roundStart = true
-	bbr.adaptUpperBounds(bbrRateSample{isAppLimited: false}, now.Add(time.Millisecond))
+		// Post-ProbeRTT round-start samples are app-limited (ProbeRTT
+		// bubble): the filter must NOT advance.
+		bbr.roundStart = true
+		bbr.adaptUpperBounds(bbrRateSample{isAppLimited: true}, now.Add(time.Millisecond))
 
-	require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth(),
-		"the first post-ProbeRTT low sample must not rotate away the prior cycle's max_bw")
+		require.Equal(t, protocol.ByteCount(10_000_000), bbr.maxBandwidth(),
+			"app-limited post-ProbeRTT samples must not rotate away the prior max_bw")
+		require.Equal(t, ackPhaseInit, bbr.ackPhase,
+			"the PROBE_STOPPING round still completes on the app-limited round start")
+	})
+
+	t.Run("valid_sample_advances_filter", func(t *testing.T) {
+		bbr := newTestBBRv3()
+		now := monotime.Now()
+
+		bbr.state = BBRProbeRTT
+		bbr.fullBandwidthReached = true
+		bbr.bwHi[0] = 10_000_000
+		bbr.bwHi[1] = 8_000_000
+
+		bbr.exitProbeRTT(now)
+
+		// A non-app-limited round start after exit ages the filter: the
+		// older slot (10 MB/s) is dropped, the current slot (8 MB/s)
+		// becomes the older slot.
+		bbr.roundStart = true
+		bbr.adaptUpperBounds(bbrRateSample{isAppLimited: false}, now.Add(time.Millisecond))
+
+		require.Equal(t, protocol.ByteCount(8_000_000), bbr.maxBandwidth(),
+			"a valid post-ProbeRTT round start must advance the max_bw filter (reference behavior)")
+	})
 }
 
 // TestBBRv3GuardrailProbeRTTRefreshesAppLimitedBubble verifies the ProbeRTT
@@ -3705,4 +3748,64 @@ func TestBBRv3LossPathPhaseTransitionUsesLossPassClock(t *testing.T) {
 		"DOWN entry must be stamped with the loss-pass time, not zero/stale")
 	require.False(t, bbr.cycleStamp.IsZero(),
 		"a zero cycleStamp would disable the wall-clock probe trigger")
+}
+
+// TestBBRv3StartupNoGrowthCountRequiresValidSamples is the regression test
+// for review finding F6 (2026-07-03): rounds in which every rate sample was
+// suppressed (interval < min_rtt) carry no bandwidth observation and must
+// not advance the full-bw plateau counter — otherwise three all-suppressed
+// rounds declare full_bw_reached on a model of nothing. Rounds with a valid
+// mid-round sample (accumulator) or a valid boundary sample still count.
+func TestBBRv3StartupNoGrowthCountRequiresValidSamples(t *testing.T) {
+	bbr := newTestBBRv3()
+	require.Equal(t, BBRStartup, bbr.state)
+	bbr.minRTT = 100 * time.Millisecond
+	bbr.bwHi[0] = 100_000
+	bbr.fullBandwidth = 100_000
+
+	// All-suppressed rounds: no valid samples anywhere in the round.
+	for range FULL_BW_ROUNDS {
+		bbr.validSamplesInRound = 0
+		bbr.roundStart = true
+		bbr.checkFullBwReached(bbrRateSample{deliveryRate: 0})
+	}
+	require.Zero(t, bbr.fullBandwidthCount,
+		"all-suppressed rounds must not advance the plateau counter")
+	require.False(t, bbr.fullBandwidthReached,
+		"Startup must not exit on rounds with zero bandwidth observations")
+
+	// A valid (below-growth-threshold) boundary sample counts even with an
+	// empty accumulator.
+	bbr.roundStart = true
+	bbr.checkFullBwReached(bbrRateSample{deliveryRate: 110_000}) // < 125_000
+	require.Equal(t, 1, bbr.fullBandwidthCount,
+		"a valid no-growth boundary sample is an observation and must count")
+}
+
+// TestBBRv3RoundDiagnosticsResetWithoutQlogger is the companion regression
+// test for review finding F6 (2026-07-03): the per-round accumulators feed
+// checkFullBwReached's zero-valid-sample guard, so their round-boundary
+// reset must run on every connection — previously it lived inside
+// maybeQlogRoundUpdate, which early-returns when no qlog recorder is
+// attached, leaving the counters to accumulate forever on non-qlog
+// connections and defeating the guard.
+func TestBBRv3RoundDiagnosticsResetWithoutQlogger(t *testing.T) {
+	bbr := newTestBBRv3() // constructed with a nil logger: no qlog recorder
+	require.Nil(t, bbr.qlogger)
+	now := monotime.Now()
+
+	// One packet sent and acked: the ACK event crosses the first round
+	// boundary, accumulates diagnostics for the ending round, and must
+	// reset them at end-of-event despite the absent qlogger.
+	bbr.OnPacketSent(now, 1_000, 1, 1_000, true)
+	ack := now.Add(20 * time.Millisecond)
+	bbr.OnPacketAcked(1, 1_000, 1_000, ack)
+	bbr.OnAckEventEnd(ack)
+
+	require.Equal(t, uint64(1), bbr.roundCount, "the ACK event crossed a round boundary")
+	require.Zero(t, bbr.validSamplesInRound,
+		"diagnostics must reset at the round boundary without a qlogger")
+	require.Zero(t, bbr.totalAckEventsInRound,
+		"diagnostics must reset at the round boundary without a qlogger")
+	require.Equal(t, bbr.roundCount, bbr.lastDiagRoundReset)
 }
